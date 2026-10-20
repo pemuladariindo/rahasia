@@ -1,20 +1,25 @@
 
 --[[
- GILDED HUB V9.3 - COMBAT FIX
- Dungeon Quest Reborn / Delta Android
+ DQR GILDED HUB V9.4
+ BOSS 1 EARLY DODGE UPDATE
+ Delta Android / Dungeon Quest Reborn
 
- FEATURES:
- - Natural WalkSpeed (no forced speed)
- - EIF then repeated E attempts during buff window
- - Face enemy while casting
- - Face AWAY when LOOK AWAY warning appears
- - Adaptive navigation and experimental dodge
- - Auto-resume after death
+ Features:
+ - Smart navigation, natural WalkSpeed
+ - EIF Q -> repeated damage E
+ - Face enemy while attacking
+ - Automatic LOOK AWAY
+ - Boss 1 attack recognition
+ - Early predictive dodge
+ - Auto resume after death
+ - Dark pink mobile GUI
 
- No HTTP requests or webhooks.
+ No HTTP, webhook, or external dependencies.
+
+ Experimental autofarm. Test under supervision.
 ]]
 
-print("[GS93] BOOT")
+print("[GS94] BOOT")
 
 local bootOK, bootError = pcall(function()
 
@@ -27,19 +32,28 @@ local WS = game:GetService("Workspace")
 local VIM = game:GetService("VirtualInputManager")
 
 local player = Players.LocalPlayer
-local pg = player:WaitForChild("PlayerGui", 10)
-assert(pg, "PlayerGui unavailable")
+local pg = player:WaitForChild("PlayerGui",10)
+assert(pg,"PlayerGui not available")
 
+-- CLEAN UP PREVIOUS HUB
 if type(_G.GS9Cleanup) == "function" then
     pcall(_G.GS9Cleanup)
 end
 
-local old = pg:FindFirstChild("GildedHubV93")
-if old then old:Destroy() end
+for _,name in ipairs({
+    "GildedHubV9",
+    "GildedHubV91",
+    "GildedHubV92",
+    "GildedHubV93",
+    "GildedHubV94"
+}) do
+    local old = pg:FindFirstChild(name)
+    if old then old:Destroy() end
+end
 
 local cfg = {
     skills = true,
-    movement = true,
+    move = true,
     dodge = true,
     facing = true,
     lookAway = true,
@@ -47,12 +61,15 @@ local cfg = {
     gates = false,
 
     qCooldown = 6,
-    buffWindow = 4,
-    qToE = 0.45,
-    eRepeat = 0.55,
+    buffWindow = 4.5,
+    qToE = 0.65,
+    eRepeat = 0.65,
 
-    attackDistance = 38,
-    standoff = 27
+    spellRange = 55,
+    standoff = 28,
+
+    dodgeThreshold = 20,
+    dodgeHold = 0.35
 }
 
 local active = true
@@ -63,33 +80,36 @@ local state = "READY"
 local enemies = {}
 local hazards = {}
 local gates = {}
-local visitedGates = {}
+local usedGates = {}
 local connections = {}
-local logs = {}
+local logHistory = {}
 
-local kills = 0
+local scannedNames = {}
+
 local scanning = false
 local waitingRespawn = false
 local sawEnemy = false
-local lastEnemyAt = 0
+local lastEnemyTime = 0
 
-local nextQ = 0
-local nextE = math.huge
-local buffUntil = 0
-local inputBusy = false
+local kills = 0
 local qCount = 0
 local eCount = 0
+local lastQ = -math.huge
+local buffUntil = 0
+local nextE = math.huge
+local inputBusy = false
 
-local currentTarget = nil
-local faceTarget = nil
+local currentTarget
+local faceTarget
+
 local gazeUntil = 0
-local gazeDetected = false
-local gazeSource = "NONE"
+local gazeVisible = false
+local gazeStatus = "IDLE"
 
-local orientation
-local orientationAttachment
-local orientationRoot
-local originalAutoRotate = true
+local align
+local attachment
+local alignedRoot
+local savedAutoRotate = true
 
 local pathPoints = {}
 local pathIndex = 1
@@ -100,13 +120,16 @@ local planning = false
 
 local lastMoveGoal
 local lastMoveAt = 0
+
 local dodgeGoal
 local dodgeUntil = 0
+local lastDodgeDecision = 0
+local dodgeCount = 0
 
-local function on(signal, callback)
-    local c = signal:Connect(callback)
-    table.insert(connections, c)
-    return c
+local function on(signal,callback)
+    local conn = signal:Connect(callback)
+    table.insert(connections,conn)
+    return conn
 end
 
 local function character()
@@ -117,23 +140,35 @@ local function character()
     local root = char:FindFirstChild("HumanoidRootPart")
 
     if hum and root and hum.Health > 0 then
-        return char, hum, root
+        return char,hum,root
     end
 end
 
--- UI
+local function contains(value,patterns)
+    value = string.lower(tostring(value))
+
+    for _,pattern in ipairs(patterns) do
+        if string.find(value,pattern,1,true) then
+            return true
+        end
+    end
+
+    return false
+end
+
+-- THEME
 local BG = Color3.fromRGB(18,22,32)
 local PANEL = Color3.fromRGB(35,40,56)
 local PINK = Color3.fromRGB(205,54,135)
 local BLUE = Color3.fromRGB(56,82,126)
 local RED = Color3.fromRGB(174,48,72)
-local WHITE = Color3.fromRGB(245,245,250)
+local WHITE = Color3.fromRGB(244,245,249)
 
-local function make(class, parent, props)
+local function make(class,parent,properties)
     local obj = Instance.new(class)
 
-    for k,v in pairs(props) do
-        obj[k] = v
+    for key,value in pairs(properties) do
+        obj[key] = value
     end
 
     obj.Parent = parent
@@ -141,19 +176,20 @@ local function make(class, parent, props)
 end
 
 local function round(obj)
-    make("UICorner", obj, {
+    make("UICorner",obj,{
         CornerRadius = UDim.new(0,7)
     })
 end
 
-local gui = make("ScreenGui", pg, {
-    Name = "GildedHubV93",
+-- CREATE GUI FIRST
+local gui = make("ScreenGui",pg,{
+    Name = "GildedHubV94",
     ResetOnSpawn = false,
     IgnoreGuiInset = true,
     DisplayOrder = 99999
 })
 
-local frame = make("Frame", gui, {
+local frame = make("Frame",gui,{
     Size = UDim2.fromOffset(332,317),
     Position = UDim2.fromOffset(18,70),
     BackgroundColor3 = BG,
@@ -172,6 +208,7 @@ local function button(parent,text,x,y,w,h,color)
         Position = UDim2.fromOffset(x,y),
         Size = UDim2.fromOffset(w,h)
     })
+
     round(b)
     return b
 end
@@ -191,7 +228,7 @@ local function label(parent,text,x,y,w,h)
 end
 
 local title = button(
-    frame,"GILDED HUB V9.3",7,7,174,35,PINK
+    frame,"GILDED HUB V9.4",7,7,174,35,PINK
 )
 local minus = button(frame,"-",185,7,43,35)
 local plus = button(frame,"+",233,7,43,35)
@@ -214,50 +251,66 @@ for i,name in ipairs({
         BorderSizePixel = 0,
         Visible = i == 1
     })
+
     round(pages[i])
 end
 
 for i,tab in ipairs(tabs) do
-    local n = i
+    local selected = i
+
     on(tab.Activated,function()
         for j,page in ipairs(pages) do
-            page.Visible = j == n
+            page.Visible = j == selected
+
             tabs[j].BackgroundColor3 =
-                j == n and PINK or PANEL
+                j == selected and PINK or PANEL
         end
     end)
 end
 
--- FARM
+-- FARM TAB
 local farm = pages[1]
-label(farm,"GILDED SKIES COMBAT FIX",8,5,216,18)
+
+label(
+    farm,"GILDED SKIES | BOSS DODGE",
+    8,4,216,20
+)
 
 local startBtn = button(
-    farm,"START AUTOFARM",8,26,216,34,PINK
-)
-local skillsBtn = button(
-    farm,"AUTO EIF + E: ON",8,65,216,27,PINK
-)
-local moveBtn = button(
-    farm,"SMART MOVEMENT: ON",8,97,216,27,PINK
-)
-local dodgeBtn = button(
-    farm,"HAZARD DODGE: ON",8,129,216,27,PINK
-)
-local resumeBtn = button(
-    farm,"AUTO RESPAWN: ON",8,161,216,27,PINK
-)
-local stopBtn = button(
-    farm,"EMERGENCY STOP",8,193,216,27,RED
+    farm,"START AUTOFARM",8,27,216,34,PINK
 )
 
--- COMBAT
+local skillBtn = button(
+    farm,"AUTO EIF + E: ON",8,66,216,27,PINK
+)
+
+local moveBtn = button(
+    farm,"SMART MOVEMENT: ON",8,98,216,27,PINK
+)
+
+local dodgeBtn = button(
+    farm,"EARLY DODGE: ON",8,130,216,27,PINK
+)
+
+local respawnBtn = button(
+    farm,"AUTO RESPAWN: ON",8,162,216,27,PINK
+)
+
+local stopBtn = button(
+    farm,"EMERGENCY STOP",8,194,216,26,RED
+)
+
+-- COMBAT TAB
 local combat = pages[2]
-label(combat,"Q = EIF   |   E = DAMAGE",8,5,216,20)
+
+label(
+    combat,"EIF -> DAMAGE ROTATION",8,5,216,20
+)
 
 local testQ = button(
     combat,"TEST Q",8,29,103,32,BLUE
 )
+
 local testE = button(
     combat,"TEST E",119,29,105,32,BLUE
 )
@@ -274,70 +327,79 @@ local cdPlus = button(
     combat,"+0.5",160,87,64,29
 )
 
-label(combat,"EIF DAMAGE WINDOW",8,122,216,16)
+label(combat,"BUFF WINDOW",8,122,216,16)
 
 local buffMinus = button(
     combat,"-0.5",8,142,65,29
 )
 local buffText = button(
-    combat,"4.0s",82,142,69,29,BLUE
+    combat,"4.5s",82,142,69,29,BLUE
 )
 local buffPlus = button(
     combat,"+0.5",160,142,64,29
 )
 
 local aimBtn = button(
-    combat,"FACE ENEMY: ON",8,179,216,20,PINK
-)
-local lookBtn = button(
-    combat,"AUTO LOOK AWAY: ON",8,202,216,20,PINK
+    combat,"FACE ENEMY: ON",8,180,216,19,PINK
 )
 
--- SENSORS
+local lookBtn = button(
+    combat,"AUTO LOOK AWAY: ON",8,202,216,19,PINK
+)
+
+-- SENSORS TAB
 local sensors = pages[3]
 
 local enemyText = label(
-    sensors,"ENEMIES: 0",8,6,216,22
+    sensors,"ENEMIES: 0",8,5,216,20
 )
+
 local targetText = label(
-    sensors,"TARGET: None",8,32,216,38
+    sensors,"TARGET: None",8,29,216,37
 )
-local faceText = label(
-    sensors,"FACING: IDLE",8,74,216,23
+
+local boss1Text = label(
+    sensors,"BOSS 1 HAZARDS: 0",8,70,216,22
 )
+
+local dodgeText = label(
+    sensors,"DODGE: IDLE",8,96,216,21
+)
+
 local gazeText = label(
-    sensors,"LOOK AWAY: INACTIVE",8,102,216,23
+    sensors,"LOOK AWAY: IDLE",8,121,216,22
 )
+
 local abilityText = label(
-    sensors,"Q: 0 | E ATTEMPTS: 0",8,130,216,23
-)
-local hazardText = label(
-    sensors,"HAZARDS: 0",8,158,216,22
+    sensors,"Q: 0 | E: 0",8,147,216,20
 )
 
 local gateBtn = button(
     sensors,"AUTO NEXT ROOM: OFF",
-    8,189,216,31,BLUE
+    8,184,216,35,BLUE
 )
 
--- DEBUG
+-- DEBUG TAB
 local debugPage = pages[4]
 
 local debugText = label(
-    debugPage,"Waiting...",8,7,216,170
+    debugPage,"Waiting for events...",
+    8,7,216,167
 )
+
 debugText.TextYAlignment = Enum.TextYAlignment.Top
 debugText.TextSize = 11
 
 local scanBtn = button(
-    debugPage,"RESCAN",8,183,105,36,BLUE
+    debugPage,"RESCAN",8,182,105,37,BLUE
 )
+
 local removeBtn = button(
-    debugPage,"REMOVE HUB",119,183,105,36,RED
+    debugPage,"REMOVE HUB",119,182,105,37,RED
 )
 
 local footer = label(
-    frame,"READY",8,286,316,25
+    frame,"READY",8,286,316,27
 )
 
 local reopen = button(
@@ -350,41 +412,49 @@ local floatStop = button(
 )
 floatStop.Visible = false
 
-local function log(text)
+local function log(message)
     if not active then return end
-    text = tostring(text)
 
-    print("[GS93] "..text)
-    table.insert(logs,1,text)
+    message = tostring(message)
+    print("[GS94] "..message)
 
-    while #logs > 6 do
-        table.remove(logs)
+    table.insert(logHistory,1,message)
+
+    while #logHistory > 6 do
+        table.remove(logHistory)
     end
 
-    debugText.Text = table.concat(logs,"\n\n")
+    debugText.Text =
+        table.concat(logHistory,"\n\n")
 end
 
-local function setState(text)
-    state = text
-    footer.Text = "STATE: "..text
+local function setState(message)
+    state = message
+    footer.Text = "STATE: "..message
 end
 
-print("[GS93] GUI READY")
+print("[GS94] GUI READY")
 log("GUI READY")
 
--- MOBILE GUI CONTROLS
-local scale = make("UIScale",frame,{Scale = 0.9})
-local sizes = {0.65,0.8,0.9,1,1.15,1.3}
-local sizeIndex = 3
+-- MOBILE UI CONTROLS
+local scale = make("UIScale",frame,{
+    Scale = 0.9
+})
+
+local scales = {
+    0.65,0.8,0.9,1,1.15,1.3
+}
+
+local scaleIndex = 3
 
 on(minus.Activated,function()
-    sizeIndex = math.max(1,sizeIndex-1)
-    scale.Scale = sizes[sizeIndex]
+    scaleIndex = math.max(1,scaleIndex-1)
+    scale.Scale = scales[scaleIndex]
 end)
 
 on(plus.Activated,function()
-    sizeIndex = math.min(#sizes,sizeIndex+1)
-    scale.Scale = sizes[sizeIndex]
+    scaleIndex = math.min(#scales,scaleIndex+1)
+    scale.Scale = scales[scaleIndex]
 end)
 
 on(hide.Activated,function()
@@ -400,10 +470,13 @@ on(reopen.Activated,function()
 end)
 
 local dragging = false
-local dragStart,dragOrigin,touchInput
+local dragStart
+local dragOrigin
+local touchInput
 
 on(title.InputBegan,function(input)
-    if input.UserInputType == Enum.UserInputType.Touch
+    if input.UserInputType ==
+        Enum.UserInputType.Touch
         or input.UserInputType ==
             Enum.UserInputType.MouseButton1 then
 
@@ -412,14 +485,18 @@ on(title.InputBegan,function(input)
         dragOrigin = frame.Position
 
         touchInput =
-            input.UserInputType == Enum.UserInputType.Touch
+            input.UserInputType ==
+                Enum.UserInputType.Touch
             and input or nil
     end
 end)
 
 on(UIS.InputChanged,function(input)
     if not dragging then return end
-    if touchInput and touchInput ~= input then return end
+
+    if touchInput and touchInput ~= input then
+        return
+    end
 
     if not touchInput and input.UserInputType ~=
         Enum.UserInputType.MouseMovement then
@@ -445,29 +522,31 @@ on(UIS.InputEnded,function(input)
 end)
 
 local function toggle(btn,prefix,value)
-    btn.Text = prefix..(value and "ON" or "OFF")
+    btn.Text = prefix..
+        (value and "ON" or "OFF")
+
     btn.BackgroundColor3 =
         value and PINK or BLUE
 end
 
-on(skillsBtn.Activated,function()
+on(skillBtn.Activated,function()
     cfg.skills = not cfg.skills
-    toggle(skillsBtn,"AUTO EIF + E: ",cfg.skills)
+    toggle(skillBtn,"AUTO EIF + E: ",cfg.skills)
 end)
 
 on(moveBtn.Activated,function()
-    cfg.movement = not cfg.movement
-    toggle(moveBtn,"SMART MOVEMENT: ",cfg.movement)
+    cfg.move = not cfg.move
+    toggle(moveBtn,"SMART MOVEMENT: ",cfg.move)
 end)
 
 on(dodgeBtn.Activated,function()
     cfg.dodge = not cfg.dodge
-    toggle(dodgeBtn,"HAZARD DODGE: ",cfg.dodge)
+    toggle(dodgeBtn,"EARLY DODGE: ",cfg.dodge)
 end)
 
-on(resumeBtn.Activated,function()
+on(respawnBtn.Activated,function()
     cfg.respawn = not cfg.respawn
-    toggle(resumeBtn,"AUTO RESPAWN: ",cfg.respawn)
+    toggle(respawnBtn,"AUTO RESPAWN: ",cfg.respawn)
 end)
 
 on(aimBtn.Activated,function()
@@ -525,9 +604,10 @@ on(buffPlus.Activated,function()
         string.format("%.1fs",cfg.buffWindow)
 end)
 
--- INPUT
+-- VIRTUAL INPUT
 local function sendKey(key)
     if inputBusy then return false end
+
     inputBusy = true
 
     local ok,err = pcall(function()
@@ -539,7 +619,8 @@ local function sendKey(key)
     inputBusy = false
 
     if not ok then
-        log("KEY ERROR: "..tostring(err):sub(1,45))
+        log("INPUT ERROR: "..
+            tostring(err):sub(1,55))
     end
 
     return ok
@@ -557,33 +638,42 @@ on(testE.Activated,function()
     end
 end)
 
--- ENEMY SCANNING
-local function contains(text,patterns)
-    text = string.lower(tostring(text))
-
-    for _,p in ipairs(patterns) do
-        if string.find(text,p,1,true) then
-            return true
-        end
-    end
-
-    return false
-end
-
+-- GILDED SKIES ENEMIES
 local mobNames = {
-    "dracani","kiryne","archpriest",
-    "cragg","vytelus","dragon lord"
+    "dracani",
+    "kiryne",
+    "archpriest",
+    "cragg",
+    "vytelus",
+    "dragon lord"
 }
 
-local bossNames = {
-    "kiryne","archpriest","cragg",
-    "vytelus","dragon lord"
+-- BOSS 1: ARCHPRIESTESS KIRYNE
+-- Names from previous Gilded Skies references.
+local boss1HazardNames = {
+    "firstbosslongline",
+    "firstbosspassivecriclehitbox",
+    "firstbosspassivecircle",
+    "firstbossbeamtrackerline",
+    "firstbossorbprecastline",
+    "firstbossmovingorb",
+    "firstbossmoveorb",
+    "archpriestmovingorb",
+    "firstbossjumpslam",
+    "firstbosspassivebeam",
+    "firstbosslefthandshot",
+    "firstbossrighthandshot",
+    "firstbossseekingspikes",
+    "firstbossminionexplosion",
+    "firstbossrocket",
+    "firstbossrockethitbox",
+    "firstbossspinningrockhitbox",
+    "firstbossspinningrock",
+    "archpriestwavecircles"
 }
 
-local hazardNames = {
+local otherHazardNames = {
     "dracanimageattack",
-    "archpriestwavecircles",
-    "archpriestblindingbeam",
     "craggcursedflame",
     "craggpinkline",
     "craggredline",
@@ -604,11 +694,19 @@ local safeNames = {
     "thirdbosssafezones"
 }
 
+local gazeBeamNames = {
+    "firstbossblindingblastbeam",
+    "archpriestblindingbeam"
+}
+
+-- REGISTER ENEMY
 local function registerEnemy(model)
     if not model or not model:IsA("Model") then
         return
     end
+
     if enemies[model] then return end
+
     if Players:GetPlayerFromCharacter(model) then
         return
     end
@@ -618,8 +716,11 @@ local function registerEnemy(model)
         return
     end
 
-    local hum = model:FindFirstChildOfClass("Humanoid")
-    local root = model:FindFirstChild("HumanoidRootPart")
+    local hum =
+        model:FindFirstChildOfClass("Humanoid")
+
+    local root =
+        model:FindFirstChild("HumanoidRootPart")
         or model.PrimaryPart
 
     if not hum or not root
@@ -634,40 +735,34 @@ local function registerEnemy(model)
     }
 
     on(hum.Died,function()
-        local e = enemies[model]
+        local entry = enemies[model]
 
-        if e and not e.counted then
-            e.counted = true
+        if entry and not entry.counted then
+            entry.counted = true
             kills = kills+1
         end
     end)
 
-    log("FOUND: "..model.Name)
+    log("ENEMY: "..model.Name)
 end
 
-local function inspect(obj)
-    if not active then return end
-
-    if obj:IsA("Model") then
-        registerEnemy(obj)
+-- REGISTER ATTACK PARTS
+local function inspectPart(part)
+    if not part:IsA("BasePart") then
         return
     end
 
-    if obj:IsA("Humanoid") then
-        registerEnemy(obj.Parent)
-        return
-    end
+    registerEnemy(part.Parent)
 
-    if not obj:IsA("BasePart") then return end
-
-    registerEnemy(obj.Parent)
-
-    local name = string.lower(obj.Name)
+    local name = string.lower(part.Name)
     local combined = name
-    local parent = obj.Parent
+    local parent = part.Parent
 
-    for _ = 1,3 do
-        if not parent or parent == WS then break end
+    -- Include names of attack models.
+    for _ = 1,5 do
+        if not parent or parent == WS then
+            break
+        end
 
         combined =
             combined.." "..string.lower(parent.Name)
@@ -675,56 +770,147 @@ local function inspect(obj)
         parent = parent.Parent
     end
 
-    if not contains(combined,safeNames) then
-        local known = contains(name,hazardNames)
+    if contains(combined,safeNames) then
+        return
+    end
 
-        local telegraph =
-            contains(combined,bossNames)
-            and contains(name,{
-                "precast","hitbox","telegraph"
-            })
+    local boss1 =
+        contains(combined,boss1HazardNames)
 
-        if (known or telegraph)
-            and not hazards[obj] then
+    local general =
+        contains(combined,otherHazardNames)
 
-            hazards[obj] = {
-                born = os.clock()
-            }
+    local genericPrecast =
+        contains(combined,{
+            "firstboss",
+            "archpriest"
+        })
+        and contains(name,{
+            "precast","telegraph"
+        })
+
+    local isGazeBeam =
+        contains(combined,gazeBeamNames)
+
+    -- Gaze blast is handled by orientation logic.
+    -- Don't treat it as a regular dodge hazard.
+    if isGazeBeam then
+        return
+    end
+
+    if (boss1 or general or genericPrecast)
+        and not hazards[part] then
+
+        local now = os.clock()
+
+        hazards[part] = {
+            born = now,
+            boss1 = boss1 or genericPrecast,
+            lastPosition = part.Position,
+            lastSample = now,
+            velocity = Vector3.zero
+        }
+
+        if boss1 or genericPrecast then
+            local attackName = string.lower(
+                part.Parent and part.Parent.Name
+                or part.Name
+            )
+
+            if not scannedNames[attackName] then
+                scannedNames[attackName] = true
+
+                log("BOSS1: "..attackName)
+            end
         end
     end
 
     if contains(name,{
-        "dungeongate","nextroom",
-        "dungeonexit","checkpoint","portal"
+        "dungeongate",
+        "nextroom",
+        "dungeonexit",
+        "checkpoint",
+        "portal"
     }) then
-        gates[obj] = true
+        gates[part] = true
     end
 end
 
-on(WS.DescendantAdded,inspect)
+local function inspect(obj)
+    if not active then return end
+
+    if obj:IsA("Model") then
+        registerEnemy(obj)
+
+    elseif obj:IsA("Humanoid") then
+        registerEnemy(obj.Parent)
+
+    elseif obj:IsA("BasePart") then
+        inspectPart(obj)
+    end
+end
+
+on(WS.DescendantAdded,function(obj)
+    inspect(obj)
+
+    -- Pre-populated attack models may arrive
+    -- with their child hitboxes already created.
+    if obj:IsA("Model")
+        and contains(obj.Name,{
+            "firstboss","archpriest"
+        }) then
+
+        task.defer(function()
+            if not active or not obj.Parent then
+                return
+            end
+
+            for _,part in ipairs(obj:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    inspectPart(part)
+                end
+            end
+        end)
+    end
+end)
 
 on(CS:GetInstanceAddedSignal("Enemy"),function(obj)
-    registerEnemy(
-        obj:IsA("Model")
+    local model = obj:IsA("Model")
         and obj
         or obj:FindFirstAncestorOfClass("Model")
-    )
+
+    registerEnemy(model)
 end)
 
 local function scanWorld()
     if scanning or not active then return end
+
     scanning = true
+    log("WORLD SCAN START")
 
     local ok,err = pcall(function()
         local objects = WS:GetDescendants()
 
         for i,obj in ipairs(objects) do
             if not active then break end
+
             inspect(obj)
 
             if i%300 == 0 then
                 task.wait()
             end
+        end
+
+        for _,obj in ipairs(
+            CS:GetTagged("Enemy")
+        ) do
+            local model = obj:IsA("Model")
+                and obj
+                or obj:FindFirstAncestorOfClass(
+                    "Model"
+                )
+
+            registerEnemy(model)
         end
     end)
 
@@ -733,7 +919,8 @@ local function scanWorld()
     if ok then
         log("SCAN COMPLETE")
     else
-        log("SCAN ERROR: "..tostring(err):sub(1,45))
+        log("SCAN ERROR: "..
+            tostring(err):sub(1,60))
     end
 end
 
@@ -741,6 +928,7 @@ on(scanBtn.Activated,function()
     task.spawn(scanWorld)
 end)
 
+-- TARGET SELECTION
 local function selectTarget(root)
     local best
     local nearest = math.huge
@@ -750,16 +938,18 @@ local function selectTarget(root)
         if not model.Parent then
             enemies[model] = nil
 
-        elseif e.root.Parent and e.hum.Parent
+        elseif e.root.Parent
+            and e.hum.Parent
             and e.hum.Health > 0 then
 
             count = count+1
 
-            local dist =
-                (root.Position-e.root.Position).Magnitude
+            local distance =
+                (root.Position-e.root.Position)
+                .Magnitude
 
-            if dist < nearest then
-                nearest = dist
+            if distance < nearest then
+                nearest = distance
 
                 best = {
                     model = model,
@@ -773,34 +963,34 @@ local function selectTarget(root)
     return best,nearest,count
 end
 
--- Select the boss responsible for gaze attacks.
 local function findGazeBoss(root)
-    local best
-    local distance = math.huge
+    local selected
+    local nearest = math.huge
 
     for model,e in pairs(enemies) do
         if model.Parent
-            and e.hum.Health > 0
             and e.root.Parent
+            and e.hum.Health > 0
             and contains(model.Name,{
                 "kiryne","archpriest"
             }) then
 
-            local d =
-                (root.Position-e.root.Position).Magnitude
+            local distance =
+                (root.Position-e.root.Position)
+                .Magnitude
 
-            if d < distance then
-                best = e.root
-                distance = d
+            if distance < nearest then
+                selected = e.root
+                nearest = distance
             end
         end
     end
 
-    return best
+    return selected
 end
 
--- FAST HUD WARNING READER
-local hudTextObjects = setmetatable({},{
+-- LOOK AWAY DETECTOR
+local textObjects = setmetatable({},{
     __mode = "k"
 })
 
@@ -809,7 +999,7 @@ local function watchText(obj)
         or obj:IsA("TextButton")
         or obj:IsA("TextBox") then
 
-        hudTextObjects[obj] = true
+        textObjects[obj] = true
     end
 end
 
@@ -819,7 +1009,7 @@ end
 
 on(pg.DescendantAdded,watchText)
 
-local function reallyVisible(obj)
+local function visible(obj)
     local node = obj
 
     while node and node ~= pg do
@@ -841,94 +1031,90 @@ end
 
 task.spawn(function()
     while active and gui.Parent do
-        task.wait(0.055)
+        task.wait(0.06)
 
         local found = false
 
-        for obj in pairs(hudTextObjects) do
+        for obj in pairs(textObjects) do
             if obj.Parent
-                and not obj:IsDescendantOf(gui) then
+                and not obj:IsDescendantOf(gui)
+                and visible(obj) then
 
-                local text = string.upper(obj.Text or "")
+                local text =
+                    string.upper(obj.Text or "")
 
-                if text:find("LOOK%s*AWAY")
-                    and reallyVisible(obj) then
-
+                if text:find("LOOK%s*AWAY") then
                     found = true
-                    gazeSource = obj.Name
                     break
                 end
             end
         end
 
         if found then
-            gazeUntil = os.clock()+0.55
+            gazeUntil = os.clock()+0.5
         end
 
-        if gazeDetected ~= found then
-            gazeDetected = found
+        if gazeVisible ~= found then
+            gazeVisible = found
 
             if found then
-                log("LOOK AWAY WARNING DETECTED")
-            else
-                log("LOOK AWAY TEXT CLEARED")
+                log("LOOK AWAY DETECTED")
             end
         end
     end
 end)
 
--- FACE CONTROLLER: ROTATION ONLY
--- No CFrame position modification.
+-- ORIENTATION CONTROLLER
 local function releaseFacing()
-    if orientation then
-        orientation:Destroy()
-        orientation = nil
+    if align then
+        align:Destroy()
+        align = nil
     end
 
-    if orientationAttachment then
-        orientationAttachment:Destroy()
-        orientationAttachment = nil
+    if attachment then
+        attachment:Destroy()
+        attachment = nil
     end
 
-    if orientationRoot and orientationRoot.Parent then
+    if alignedRoot and alignedRoot.Parent then
         local hum =
-            orientationRoot.Parent:FindFirstChildOfClass(
-                "Humanoid"
-            )
+            alignedRoot.Parent:
+            FindFirstChildOfClass("Humanoid")
 
         if hum then
-            hum.AutoRotate = originalAutoRotate
+            hum.AutoRotate = savedAutoRotate
         end
     end
 
-    orientationRoot = nil
+    alignedRoot = nil
 end
 
 local function prepareFacing(hum,root)
-    if orientationRoot == root and orientation then
+    if alignedRoot == root and align then
         return
     end
 
     releaseFacing()
 
-    orientationRoot = root
-    originalAutoRotate = hum.AutoRotate
+    alignedRoot = root
+    savedAutoRotate = hum.AutoRotate
 
-    orientationAttachment = Instance.new("Attachment")
-    orientationAttachment.Name = "GS93AimAttachment"
-    orientationAttachment.Parent = root
+    attachment = Instance.new("Attachment")
+    attachment.Name = "GS94FacingAttachment"
+    attachment.Parent = root
 
-    orientation = Instance.new("AlignOrientation")
-    orientation.Name = "GS93Facing"
-    orientation.Mode =
+    align = Instance.new("AlignOrientation")
+    align.Name = "GS94Facing"
+    align.Mode =
         Enum.OrientationAlignmentMode.OneAttachment
-    orientation.Attachment0 = orientationAttachment
-    orientation.MaxTorque = 1000000000
-    orientation.MaxAngularVelocity = 1000000
-    orientation.Responsiveness = 200
-    orientation.RigidityEnabled = true
-    orientation.Enabled = false
-    orientation.Parent = root
+
+    align.Attachment0 = attachment
+    align.MaxTorque = 250000
+    align.MaxAngularVelocity = 100
+    align.Responsiveness = 65
+    align.RigidityEnabled = false
+    align.Enabled = false
+    align.Parent = root
 end
 
 local function faceDirection(hum,root,direction)
@@ -936,37 +1122,42 @@ local function faceDirection(hum,root,direction)
         direction.X,0,direction.Z
     )
 
-    if flat.Magnitude < 0.05 then return end
+    if flat.Magnitude < 0.05 then
+        return
+    end
 
     prepareFacing(hum,root)
 
     hum.AutoRotate = false
-    orientation.Enabled = true
+    align.Enabled = true
 
-    orientation.CFrame = CFrame.lookAt(
-        Vector3.zero,flat.Unit
+    align.CFrame = CFrame.lookAt(
+        Vector3.zero,
+        flat.Unit
     )
 end
 
-local function releaseRotation(hum)
-    if orientation then
-        orientation.Enabled = false
+local function naturalFacing(hum)
+    if align then
+        align.Enabled = false
     end
 
     if hum then
-        hum.AutoRotate = originalAutoRotate
+        hum.AutoRotate = savedAutoRotate
     end
 end
 
--- Heartbeat updates facing without changing position.
 on(RS.Heartbeat,function()
-    if not active or not running then return end
+    if not active or not running then
+        return
+    end
 
     local char,hum,root = character()
     if not root then return end
 
     local gazeActive =
-        cfg.lookAway and os.clock() < gazeUntil
+        cfg.lookAway
+        and os.clock() < gazeUntil
 
     if gazeActive then
         local boss = findGazeBoss(root)
@@ -976,16 +1167,22 @@ on(RS.Heartbeat,function()
         end
 
         if boss and boss.Parent then
-            local away = root.Position-boss.Position
-            faceDirection(hum,root,away)
+            faceDirection(
+                hum,root,
+                root.Position-boss.Position
+            )
+
+            gazeStatus = "FACING AWAY"
         else
-            releaseRotation(hum)
+            gazeStatus = "NO BOSS TARGET"
+            naturalFacing(hum)
         end
 
         return
     end
 
-    if cfg.facing and faceTarget
+    if cfg.facing
+        and faceTarget
         and faceTarget.Parent then
 
         faceDirection(
@@ -993,48 +1190,127 @@ on(RS.Heartbeat,function()
             faceTarget.Position-root.Position
         )
     else
-        releaseRotation(hum)
+        naturalFacing(hum)
     end
 end)
 
--- HAZARDS
+-- BOSS 1 PREDICTIVE HAZARD SCORING
+local predictionTimes = {
+    0,0.3,0.6
+}
+
 local function dangerAt(position)
-    local risk,count = 0,0
+    local risk = 0
+    local count = 0
+    local boss1Count = 0
     local now = os.clock()
 
-    for part,e in pairs(hazards) do
-        if not part.Parent or now-e.born > 9 then
+    for part,data in pairs(hazards) do
+        if not part.Parent
+            or now-data.born > 10 then
+
             hazards[part] = nil
+
         else
             count = count+1
 
-            if (part.Position-position).Magnitude < 100 then
-                local p =
-                    part.CFrame:PointToObjectSpace(position)
-                local h = part.Size*0.5
+            if data.boss1 then
+                boss1Count = boss1Count+1
+            end
 
-                if math.abs(p.Y) < h.Y+8 then
-                    local x = math.max(math.abs(p.X)-h.X,0)
-                    local z = math.max(math.abs(p.Z)-h.Z,0)
-                    local gap = math.sqrt(x*x+z*z)
+            local near =
+                (part.Position-position).Magnitude
 
-                    if gap < 4 then
-                        risk = risk+100
-                    elseif gap < 13 then
-                        risk = risk+(13-gap)*4
+            if near < 140 then
+                -- Estimate motion from sampled positions.
+                -- Helps when the part moves via CFrame.
+                local dt =
+                    now-(data.lastSample or now)
+
+                if dt >= 0.10 then
+                    local previous =
+                        data.lastPosition
+                        or part.Position
+
+                    local measured =
+                        (part.Position-previous)/dt
+
+                    if measured.Magnitude < 200 then
+                        data.velocity =
+                            (data.velocity or Vector3.zero)
+                            :Lerp(measured,0.6)
+                    end
+
+                    data.lastPosition = part.Position
+                    data.lastSample = now
+                end
+
+                local velocity =
+                    data.velocity or Vector3.zero
+
+                if velocity.Magnitude < 1 then
+                    velocity =
+                        part.AssemblyLinearVelocity
+                end
+
+                local padding =
+                    data.boss1 and 25 or 17
+
+                local highest = 0
+                local half = part.Size*0.5
+
+                for _,ahead in ipairs(predictionTimes) do
+                    local predictedCF =
+                        part.CFrame+velocity*ahead
+
+                    local p =
+                        predictedCF:PointToObjectSpace(
+                            position
+                        )
+
+                    if math.abs(p.Y) < half.Y+9 then
+                        local dx = math.max(
+                            math.abs(p.X)-half.X,0
+                        )
+
+                        local dz = math.max(
+                            math.abs(p.Z)-half.Z,0
+                        )
+
+                        local gap =
+                            math.sqrt(dx*dx+dz*dz)
+
+                        local score = 0
+
+                        if gap < 5 then
+                            score = 140
+
+                        elseif gap < padding then
+                            score =
+                                30+(padding-gap)*4
+                        end
+
+                        highest = math.max(
+                            highest,score
+                        )
                     end
                 end
+
+                risk = risk+highest
             end
         end
     end
 
-    return risk,count
+    return risk,count,boss1Count
 end
 
+-- LINE OF SIGHT
 local function clearLine(char,targetModel,a,b)
     local params = RaycastParams.new()
+
     params.FilterType =
         Enum.RaycastFilterType.Exclude
+
     params.RespectCanCollide = true
 
     local excluded = {char}
@@ -1045,66 +1321,98 @@ local function clearLine(char,targetModel,a,b)
 
     params.FilterDescendantsInstances = excluded
 
-    local start = a+Vector3.new(0,2,0)
-    local finish = b+Vector3.new(0,2,0)
+    local start =
+        a+Vector3.new(0,2,0)
+
+    local finish =
+        b+Vector3.new(0,2,0)
 
     return WS:Raycast(
         start,finish-start,params
     ) == nil
 end
 
+-- FIND EARLY DODGE DESTINATION
 local function findDodge(char,root)
     local params = RaycastParams.new()
+
     params.FilterType =
         Enum.RaycastFilterType.Exclude
+
     params.FilterDescendantsInstances = {char}
     params.RespectCanCollide = true
 
-    local currentRisk = dangerAt(root.Position)
-    local best,bestScore
+    local currentRisk =
+        dangerAt(root.Position)
 
-    for _,radius in ipairs({14,24}) do
-        for i = 1,12 do
-            local a = i*math.pi/6
+    local best
+    local bestScore = math.huge
+    local bestRisk = math.huge
+
+    -- Try short escapes first.
+    for _,radius in ipairs({10,18,27}) do
+        for i = 1,8 do
+            local a = 2*math.pi*i/8
 
             local offset = Vector3.new(
-                math.cos(a)*radius,0,
+                math.cos(a)*radius,
+                0,
                 math.sin(a)*radius
             )
 
-            local candidate = root.Position+offset
+            local point =
+                root.Position+offset
 
             local ground = WS:Raycast(
-                candidate+Vector3.new(0,8,0),
+                point+Vector3.new(0,8,0),
                 Vector3.new(0,-26,0),
                 params
             )
 
-            if ground and clearLine(
-                char,nil,root.Position,candidate
-            ) then
+            if ground
+                and math.abs(
+                    ground.Position.Y-root.Position.Y
+                ) < 8
+                and ground.Normal.Y > 0.65
+                and clearLine(
+                    char,nil,root.Position,point
+                ) then
 
                 local goal = Vector3.new(
-                    candidate.X,
+                    point.X,
                     ground.Position.Y+3,
-                    candidate.Z
+                    point.Z
                 )
 
-                local cost = dangerAt(goal)*10+radius*0.2
+                local candidateRisk =
+                    dangerAt(goal)
 
-                if not best or cost < bestScore then
-                    best,bestScore = goal,cost
+                -- Safe nearby escape.
+                if candidateRisk <= 1 then
+                    return goal
+                end
+
+                local score =
+                    candidateRisk*12+radius*0.5
+
+                if score < bestScore then
+                    best = goal
+                    bestScore = score
+                    bestRisk = candidateRisk
                 end
             end
         end
     end
 
-    if best and bestScore < currentRisk*8 then
+    if best and bestRisk < currentRisk then
         return best
     end
+
+    return nil
 end
 
--- MOVEMENT
+-- NATURAL SPEED NAVIGATION
+-- Never changes WalkSpeed or teleports position.
 local function resetPath()
     pathToken = pathToken+1
     pathPoints = {}
@@ -1115,13 +1423,16 @@ local function resetPath()
     lastMoveGoal = nil
 end
 
-local function moveTo(hum,goal,urgent)
+local function issueMove(hum,goal,urgent)
+    if not goal then return end
+
     local now = os.clock()
-    local delay = urgent and 0.2 or 0.8
+    local interval = urgent and 0.12 or 0.7
+    local threshold = urgent and 2 or 5
 
     if not lastMoveGoal
-        or (goal-lastMoveGoal).Magnitude > 5
-        or now-lastMoveAt >= delay then
+        or (goal-lastMoveGoal).Magnitude > threshold
+        or now-lastMoveAt >= interval then
 
         hum:MoveTo(goal)
         lastMoveGoal = goal
@@ -1130,22 +1441,34 @@ local function moveTo(hum,goal,urgent)
 end
 
 local function navigate(char,hum,root,goal,model)
-    if clearLine(char,model,root.Position,goal) then
-        if pathGoal then resetPath() end
-        moveTo(hum,goal,false)
+    if not running or not goal then
+        return
+    end
+
+    if clearLine(
+        char,model,root.Position,goal
+    ) then
+
+        if pathGoal then
+            resetPath()
+        end
+
+        issueMove(hum,goal,false)
         return
     end
 
     local now = os.clock()
 
-    if (not pathGoal
+    local newPath =
+        not pathGoal
         or (goal-pathGoal).Magnitude > 14
-        or now-pathAt > 3.5)
-        and not planning then
+        or now-pathAt > 3
 
+    if newPath and not planning then
         planning = true
         pathGoal = goal
         pathAt = now
+
         pathToken = pathToken+1
 
         local token = pathToken
@@ -1165,6 +1488,7 @@ local function navigate(char,hum,root,goal,model)
 
                 if path.Status ==
                     Enum.PathStatus.Success then
+
                     return path:GetWaypoints()
                 end
 
@@ -1174,20 +1498,22 @@ local function navigate(char,hum,root,goal,model)
             if not active or not running
                 or epoch ~= runEpoch
                 or token ~= pathToken then
+
                 return
             end
 
             pathPoints = ok and points or {}
             pathIndex =
                 #pathPoints >= 2 and 2 or 1
+
             planning = false
         end)
     end
 
     local wp = pathPoints[pathIndex]
 
-    while wp and
-        (root.Position-wp.Position).Magnitude < 5 do
+    while wp
+        and (root.Position-wp.Position).Magnitude < 5 do
 
         pathIndex = pathIndex+1
         wp = pathPoints[pathIndex]
@@ -1196,87 +1522,101 @@ local function navigate(char,hum,root,goal,model)
     if wp then
         if wp.Action ==
             Enum.PathWaypointAction.Jump then
+
             hum.Jump = true
         end
 
-        moveTo(hum,wp.Position,false)
+        issueMove(hum,wp.Position,false)
     end
 end
 
 local function nextGate(root)
-    local best
+    local selected
     local nearest = math.huge
 
     for part in pairs(gates) do
         if part.Parent
-            and not visitedGates[part]
+            and not usedGates[part]
             and not part.CanCollide then
 
             local d =
                 (part.Position-root.Position).Magnitude
 
             if d < 160 and d < nearest then
-                best,nearest = part,d
+                selected = part
+                nearest = d
             end
         end
     end
 
-    return best,nearest
+    return selected,nearest
 end
 
--- COMBAT: REPEAT E WHILE EIF WINDOW IS OPEN
-local function attackCycle(target,distance,risk)
-    if not running or not cfg.skills then return end
-    if not target or distance > cfg.attackDistance then
+-- EIF -> E COMBAT
+local function castRotation(target,distance,risk)
+    if not running or not cfg.skills then
         return
     end
 
-    if risk >= 25 then return end
-    if cfg.lookAway and os.clock() < gazeUntil then
+    if not target
+        or distance > cfg.spellRange then
+        return
+    end
+
+    if risk >= cfg.dodgeThreshold then
+        return
+    end
+
+    if cfg.lookAway
+        and os.clock() < gazeUntil then
         return
     end
 
     local char,hum,root = character()
     if not root then return end
 
-    -- Wait until character is facing target.
     if cfg.facing then
-        local delta = target.root.Position-root.Position
-        local flat = Vector3.new(delta.X,0,delta.Z)
+        local delta =
+            target.root.Position-root.Position
 
-        if flat.Magnitude > 0.1 then
-            local facing = root.CFrame.LookVector
-            local flatFacing = Vector3.new(
-                facing.X,0,facing.Z
-            )
+        local flat = Vector3.new(
+            delta.X,0,delta.Z
+        )
 
-            if flatFacing.Magnitude > 0.1
-                and flatFacing.Unit:Dot(flat.Unit) < 0.7 then
-                return
-            end
+        local look = root.CFrame.LookVector
+        local flatLook = Vector3.new(
+            look.X,0,look.Z
+        )
+
+        if flat.Magnitude > 0.1
+            and flatLook.Magnitude > 0.1
+            and flatLook.Unit:Dot(flat.Unit) < 0.7 then
+
+            return
         end
     end
 
     local now = os.clock()
 
-    if now >= nextQ and now >= buffUntil then
-        if inputBusy then return end
+    if now-lastQ >= cfg.qCooldown
+        and now >= buffUntil
+        and not inputBusy then
 
-        nextQ = now+cfg.qCooldown
+        lastQ = now
         buffUntil = now+cfg.buffWindow
         nextE = now+cfg.qToE
-
         qCount = qCount+1
-        log("EIF Q -> E WINDOW OPEN")
-        setState("EIF BUFF")
+
+        setState("CAST EIF")
+        log("EIF ACTIVATED - E WINDOW")
 
         local runEpoch = epoch
 
         task.spawn(function()
             local ok = sendKey(Enum.KeyCode.Q)
 
-            if not ok and epoch == runEpoch then
-                nextQ = 0
+            if not ok and runEpoch == epoch then
+                lastQ = -math.huge
                 buffUntil = 0
                 nextE = math.huge
             end
@@ -1285,26 +1625,28 @@ local function attackCycle(target,distance,risk)
         return
     end
 
-    -- E is retried repeatedly, rather than once.
+    -- Repeated E attempts while buff window
+    -- is estimated to remain active.
     if now >= nextE
-        and now < buffUntil-0.15
+        and now < buffUntil-0.1
         and not inputBusy then
 
         nextE = now+cfg.eRepeat
         eCount = eCount+1
 
-        setState("DAMAGE E")
-        task.spawn(sendKey,Enum.KeyCode.E)
+        setState("CAST DAMAGE E")
 
-        if eCount <= 3 or eCount%5 == 0 then
-            log("E INPUT ATTEMPT "..eCount)
-        end
+        task.spawn(
+            sendKey,Enum.KeyCode.E
+        )
     end
 end
 
+-- STOP FARM
 local function stopFarm()
     running = false
     epoch = epoch+1
+
     waitingRespawn = false
     currentTarget = nil
     faceTarget = nil
@@ -1312,8 +1654,8 @@ local function stopFarm()
     dodgeUntil = 0
 
     buffUntil = 0
-    nextQ = 0
     nextE = math.huge
+    lastQ = -math.huge
 
     resetPath()
     releaseFacing()
@@ -1322,6 +1664,7 @@ local function stopFarm()
     floatStop.Visible = false
 
     local char,hum,root = character()
+
     if hum and root then
         hum:MoveTo(root.Position)
     end
@@ -1333,6 +1676,7 @@ end
 on(stopBtn.Activated,stopFarm)
 on(floatStop.Activated,stopFarm)
 
+-- START FARM
 on(startBtn.Activated,function()
     if running then
         stopFarm()
@@ -1346,9 +1690,12 @@ on(startBtn.Activated,function()
         return
     end
 
-    local dungeon = WS:FindFirstChild("dungeonName")
+    local dungeon = WS:FindFirstChild(
+        "dungeonName"
+    )
 
-    if dungeon and dungeon:IsA("StringValue")
+    if dungeon
+        and dungeon:IsA("StringValue")
         and dungeon.Value ~= "Gilded Skies" then
 
         log("WRONG DUNGEON: "..dungeon.Value)
@@ -1357,13 +1704,17 @@ on(startBtn.Activated,function()
 
     running = true
     epoch = epoch+1
+
     waitingRespawn = false
     sawEnemy = false
-    lastEnemyAt = os.clock()
+    lastEnemyTime = os.clock()
 
-    nextQ = 0
-    nextE = math.huge
+    lastQ = -math.huge
     buffUntil = 0
+    nextE = math.huge
+
+    dodgeGoal = nil
+    dodgeUntil = 0
 
     resetPath()
     task.spawn(scanWorld)
@@ -1375,25 +1726,31 @@ on(startBtn.Activated,function()
     log("FARM STARTED")
 end)
 
+-- AUTO RESPAWN
 on(player.CharacterAdded,function()
     if running then
         epoch = epoch+1
         waitingRespawn = true
 
-        faceTarget = nil
         currentTarget = nil
+        faceTarget = nil
+        dodgeGoal = nil
+
         buffUntil = 0
-        nextQ = 0
         nextE = math.huge
+        lastQ = -math.huge
 
         resetPath()
         releaseFacing()
+
         setState("RESPAWNING")
     end
 end)
 
+-- CLEANUP
 local function cleanup()
     if not active then return end
+
     active = false
     running = false
     epoch = epoch+1
@@ -1416,33 +1773,34 @@ _G.GS9Cleanup = cleanup
 on(removeBtn.Activated,cleanup)
 gui.Destroying:Connect(cleanup)
 
--- FARM CONTROLLER
+-- MAIN CONTROLLER
 task.spawn(function()
     local lastUI = 0
-    local lastTags = 0
+    local lastTagScan = 0
     local lastStuck = 0
-    local previousPosition
+    local oldPosition
     local failures = 0
 
     while active and gui.Parent do
-        task.wait(0.12)
+        task.wait(0.08)
 
         local ok,err = pcall(function()
             local now = os.clock()
 
-            if now-lastTags > 3 then
-                lastTags = now
+            if now-lastTagScan > 3 then
+                lastTagScan = now
 
                 for _,obj in ipairs(
                     CS:GetTagged("Enemy")
                 ) do
-                    registerEnemy(
-                        obj:IsA("Model")
+                    local model = obj:IsA("Model")
                         and obj
-                        or obj:FindFirstAncestorOfClass(
+                        or obj:
+                        FindFirstAncestorOfClass(
                             "Model"
                         )
-                    )
+
+                    registerEnemy(model)
                 end
             end
 
@@ -1456,6 +1814,8 @@ task.spawn(function()
 
                         faceTarget = nil
                         currentTarget = nil
+                        dodgeGoal = nil
+
                         resetPath()
                         releaseFacing()
 
@@ -1474,11 +1834,17 @@ task.spawn(function()
 
             if running and waitingRespawn then
                 waitingRespawn = false
-                nextQ = 0
+
+                lastQ = -math.huge
                 buffUntil = 0
                 nextE = math.huge
 
+                dodgeGoal = nil
+                dodgeUntil = 0
+
+                resetPath()
                 task.spawn(scanWorld)
+
                 log("AUTO RESUMED")
             end
 
@@ -1489,70 +1855,112 @@ task.spawn(function()
 
             if count > 0 then
                 sawEnemy = true
-                lastEnemyAt = now
+                lastEnemyTime = now
             end
 
-            local risk,hazardCount =
+            local risk,hazardCount,boss1Count =
                 dangerAt(root.Position)
 
             local gazeActive =
-                cfg.lookAway and now < gazeUntil
+                cfg.lookAway
+                and now < gazeUntil
 
             if running then
-                -- Highest priority: LOOK AWAY.
+                -- PRIORITY 1: LOOK AWAY
                 if gazeActive then
                     faceTarget = nil
                     setState("LOOK AWAY")
 
-                    -- Stop chasing; facing controller
-                    -- rotates away from Kiryne.
-                    if cfg.dodge and risk >= 25 then
-                        local safe = findDodge(char,root)
+                    -- Keep facing AWAY from boss.
+                    -- If overlapping another hazard,
+                    -- movement may still dodge.
+                    if cfg.dodge
+                        and risk >= cfg.dodgeThreshold then
 
-                        if safe then
-                            moveTo(hum,safe,true)
+                        if now-lastDodgeDecision > 0.2 then
+                            lastDodgeDecision = now
+
+                            dodgeGoal =
+                                findDodge(char,root)
+
+                            dodgeUntil =
+                                now+cfg.dodgeHold
+                        end
+
+                        if dodgeGoal then
+                            issueMove(
+                                hum,dodgeGoal,true
+                            )
                         end
                     else
-                        moveTo(hum,root.Position,true)
+                        issueMove(
+                            hum,root.Position,true
+                        )
                     end
 
-                elseif cfg.dodge and risk >= 25 then
+                -- PRIORITY 2: EARLY DODGE
+                elseif cfg.dodge
+                    and risk >= cfg.dodgeThreshold then
+
                     faceTarget = nil
-                    setState("DODGING")
+                    setState("EARLY DODGE")
 
                     if not dodgeGoal
+                        or now-lastDodgeDecision > 0.28
                         or now >= dodgeUntil then
 
-                        dodgeGoal = findDodge(char,root)
-                        dodgeUntil = now+0.5
+                        lastDodgeDecision = now
+
+                        local candidate =
+                            findDodge(char,root)
+
+                        if candidate then
+                            dodgeGoal = candidate
+                            dodgeUntil =
+                                now+cfg.dodgeHold
+
+                            dodgeCount = dodgeCount+1
+                        end
                     end
 
                     if dodgeGoal then
-                        moveTo(hum,dodgeGoal,true)
+                        issueMove(
+                            hum,dodgeGoal,true
+                        )
                     end
 
-                elseif dodgeGoal and now < dodgeUntil then
+                -- PRIORITY 3: FINISH DODGE
+                elseif cfg.dodge
+                    and dodgeGoal
+                    and now < dodgeUntil then
+
                     faceTarget = nil
                     setState("DODGE COMMIT")
-                    moveTo(hum,dodgeGoal,true)
 
+                    issueMove(
+                        hum,dodgeGoal,true
+                    )
+
+                -- PRIORITY 4: NORMAL COMBAT
                 else
-                    dodgeGoal = nil
+                    if dodgeGoal then
+                        dodgeGoal = nil
+                        dodgeUntil = 0
+                        resetPath()
+                    end
 
                     if target then
-                        -- Face target only when near enough
-                        -- to attack. Let natural rotation
-                        -- handle long-distance navigation.
                         if cfg.facing
                             and distance <=
-                                cfg.attackDistance+5 then
+                                cfg.spellRange+5 then
 
-                            faceTarget = target.root
+                            faceTarget =
+                                target.root
                         else
                             faceTarget = nil
                         end
 
-                        if cfg.movement then
+                        if cfg.move then
                             if distance >
                                 cfg.standoff+3 then
 
@@ -1560,44 +1968,56 @@ task.spawn(function()
                                     target.root.Position
                                     - root.Position
 
-                                local flat = Vector3.new(
-                                    delta.X,0,delta.Z
-                                )
+                                local flat =
+                                    Vector3.new(
+                                        delta.X,0,delta.Z
+                                    )
 
                                 if flat.Magnitude > 1 then
                                     local goal =
                                         target.root.Position
-                                        - flat.Unit*cfg.standoff
+                                        - flat.Unit
+                                        * cfg.standoff
 
                                     navigate(
                                         char,hum,root,
                                         goal,target.model
                                     )
 
-                                    setState("NAVIGATING")
+                                    setState(
+                                        "NAVIGATING"
+                                    )
                                 end
+
                             else
-                                moveTo(
-                                    hum,root.Position,false
+                                issueMove(
+                                    hum,
+                                    root.Position,
+                                    false
                                 )
                             end
                         end
 
-                        attackCycle(target,distance,risk)
+                        castRotation(
+                            target,distance,risk
+                        )
 
                     else
                         faceTarget = nil
                         setState("WAITING NEXT WAVE")
 
-                        if cfg.gates and cfg.movement
+                        if cfg.gates
+                            and cfg.move
                             and sawEnemy
-                            and now-lastEnemyAt > 3 then
+                            and now-lastEnemyTime > 3 then
 
-                            local gate,d = nextGate(root)
+                            local gate,d =
+                                nextGate(root)
 
                             if gate then
                                 if d < 9 then
-                                    visitedGates[gate] = true
+                                    usedGates[gate] =
+                                        true
                                 else
                                     navigate(
                                         char,hum,root,
@@ -1611,22 +2031,24 @@ task.spawn(function()
                     if now-lastStuck > 3.5 then
                         lastStuck = now
 
-                        if previousPosition
+                        if oldPosition
                             and target
-                            and cfg.movement
+                            and cfg.move
                             and distance >
                                 cfg.standoff+12
                             and (
-                                root.Position
-                                - previousPosition
+                                root.Position-oldPosition
                             ).Magnitude < 1.5 then
 
                             resetPath()
                             hum.Jump = true
-                            log("STUCK: REPLANNING")
+
+                            log(
+                                "STUCK - REPLANNING"
+                            )
                         end
 
-                        previousPosition = root.Position
+                        oldPosition = root.Position
                     end
                 end
             end
@@ -1642,22 +2064,23 @@ task.spawn(function()
                     (target and target.model.Name
                         or "None")
 
-                faceText.Text =
-                    "FACING: "..
-                    (gazeActive and "AWAY FROM BOSS"
-                    or faceTarget and "ENEMY"
-                    or "NATURAL")
+                boss1Text.Text =
+                    "BOSS 1 HAZARDS: "..
+                    boss1Count
+
+                dodgeText.Text =
+                    "DODGE: "..dodgeCount..
+                    " | RISK: "..
+                    math.floor(risk)
 
                 gazeText.Text =
                     "LOOK AWAY: "..
-                    (gazeActive and "ACTIVE" or "OFF")
+                    (gazeActive and "ACTIVE"
+                        or "IDLE")
 
                 abilityText.Text =
                     "Q: "..qCount..
-                    " | E ATTEMPTS: "..eCount
-
-                hazardText.Text =
-                    "HAZARDS: "..hazardCount
+                    " | E: "..eCount
 
                 footer.Text =
                     "STATE: "..state..
@@ -1669,30 +2092,35 @@ task.spawn(function()
             failures = 0
         else
             failures = failures+1
-            log("ERROR: "..tostring(err):sub(1,65))
+
+            log(
+                "LOOP ERROR: "..
+                tostring(err):sub(1,65)
+            )
 
             if failures >= 3 then
                 if running then
                     stopFarm()
                 end
 
-                log("STOPPED: REPEATED ERRORS")
+                log("STOPPED AFTER ERRORS")
                 failures = 0
             end
         end
     end
 end)
 
+-- LOAD SENSORS AFTER GUI
 task.defer(scanWorld)
 
 log("CONTROLLER READY")
-print("[GS93] COMPLETE")
+print("[GS94] COMPLETE")
 
 end)
 
 if not bootOK then
     warn(
-        "[GS93] STARTUP ERROR: "..
+        "[GS94] STARTUP ERROR: "..
         tostring(bootError)
     )
 end
