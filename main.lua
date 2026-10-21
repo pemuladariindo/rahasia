@@ -1,5 +1,5 @@
 --[[
-  GILDED HUB V10.0 - HARVARD-INSPIRED DODGE PLANNER
+  GILDED HUB V10.1 - ONE CLICK AUTO DUNGEON
   Dungeon Quest Reborn / Gilded Skies / Delta Android
 
   Original rewrite from observed techniques in a deobfuscated reference:
@@ -13,7 +13,7 @@
   Experimental; timings are estimates, not verified actual hit frames.
 ]]
 
-print('[GS10] BOOT')
+print('[GS101] BOOT')
 
 local bootOK, bootError = pcall(function()
 local Players = game:GetService('Players')
@@ -34,7 +34,8 @@ if type(_G.GS9Cleanup) == 'function' then
     pcall(_G.GS9Cleanup)
 end
 pcall(function() RunService:UnbindFromRenderStep('GS10_MOTOR') end)
-for _, name in ipairs({'GildedHubV96', 'GildedHubV10'}) do
+pcall(function() RunService:UnbindFromRenderStep('GS101_MOTOR') end)
+for _, name in ipairs({'GildedHubV96', 'GildedHubV10', 'GildedHubV101'}) do
     local existing = playerGui:FindFirstChild(name)
     if existing then existing:Destroy() end
 end
@@ -48,7 +49,7 @@ local scanBusy = false
 local cfg = {
     autoSkill = true, autoMove = true, dodge = true,
     faceEnemy = true, lookMechanic = true,
-    autoRespawn = true, nextRoom = false,
+    autoRespawn = true, nextRoom = true,
     qCooldown = 6, qToE = 0.28, eRepeat = 0.55,
     buffWindow = 4.0, castRange = 54, standoff = 30,
     planningHorizon = 1.5, planningDt = 0.15,
@@ -69,6 +70,9 @@ local path = {token = 0, points = {}, index = 1, goal = nil, mode = nil, pending
 local lastQ, buffUntil, nextE = -math.huge, 0, math.huge
 local qCount, eCount, keyBusy = 0, 0, false
 local respawning, sawEnemy, lastEnemyAt = false, false, 0
+local lastRoomScan, lastVictoryScan, roomState, gateVisitCount = 0, 0, 'WAITING', 0
+local visitedGates = setmetatable({}, {__mode='k'})
+local currentGate = nil
 local gaze = {active = false, toward = false, source = nil, untilAt = 0}
 local rotatingRoot, facingAlign, facingAttachment, originalAutoRotate
 local controls, controlsLocked
@@ -90,7 +94,3 @@ end
 local function lower(s) return string.lower(tostring(s or '')) end
 local function has(s, frag) return string.find(lower(s), frag, 1, true) ~= nil end
 local function flat(v)
-    local v2 = Vector3.new(v.X,0,v.Z)
-    return v2.Magnitude > 0.001 and v2.Unit or Vector3.zero
-end
-local function now() return os.clock() end
