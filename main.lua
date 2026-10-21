@@ -1,96 +1,90 @@
---[[
-  GILDED HUB V10.1 - ONE CLICK AUTO DUNGEON
-  Dungeon Quest Reborn / Gilded Skies / Delta Android
-
-  Original rewrite from observed techniques in a deobfuscated reference:
-  - classify attack models by precast / hitbox / shape
-  - track attack activation windows, not just proximity
-  - score future positions and paths using estimated travel speed
-  - allow ONE movement controller to steer chase and dodge
-  - special first-boss look-away GUI detection
-
-  No network requests, webhook, external loader or leaked code execution.
-  Experimental; timings are estimates, not verified actual hit frames.
-]]
-
-print('[GS101] BOOT')
-
-local bootOK, bootError = pcall(function()
-local Players = game:GetService('Players')
-local Workspace = game:GetService('Workspace')
-local CollectionService = game:GetService('CollectionService')
-local PathfindingService = game:GetService('PathfindingService')
-local RunService = game:GetService('RunService')
-local UserInputService = game:GetService('UserInputService')
-local VirtualInputManager = game:GetService('VirtualInputManager')
-local ReplicatedStorage = game:GetService('ReplicatedStorage')
-
-local player = Players.LocalPlayer
-assert(player, 'LocalPlayer missing')
-local playerGui = player:WaitForChild('PlayerGui', 10)
-assert(playerGui, 'PlayerGui missing')
-
-if type(_G.GS9Cleanup) == 'function' then
-    pcall(_G.GS9Cleanup)
+-- DQR FIX LOADER: paste THIS entire code into Delta.
+-- It creates a pink status window BEFORE attempting to load GitHub.
+local pg = game:GetService("Players").LocalPlayer:WaitForChild("PlayerGui",10)
+if not pg then warn("[DQR] PlayerGui missing") return end
+for _,name in ipairs({"DQR_TEST","DQRLoaderCheckV2","DQRBootFix"}) do
+    local old=pg:FindFirstChild(name)
+    if old then old:Destroy() end
 end
-pcall(function() RunService:UnbindFromRenderStep('GS10_MOTOR') end)
-pcall(function() RunService:UnbindFromRenderStep('GS101_MOTOR') end)
-for _, name in ipairs({'GildedHubV96', 'GildedHubV10', 'GildedHubV101'}) do
-    local existing = playerGui:FindFirstChild(name)
-    if existing then existing:Destroy() end
+local gui=Instance.new("ScreenGui")
+gui.Name="DQRBootFix"
+gui.ResetOnSpawn=false
+gui.DisplayOrder=1000000
+gui.IgnoreGuiInset=true
+gui.Parent=pg
+local frame=Instance.new("Frame")
+frame.Size=UDim2.fromOffset(345,276)
+frame.Position=UDim2.new(0.5,-172,0.07,0)
+frame.BackgroundColor3=Color3.fromRGB(35,25,42)
+frame.BorderSizePixel=0
+frame.Parent=gui
+local label=Instance.new("TextLabel")
+label.Size=UDim2.new(1,-20,1,-62)
+label.Position=UDim2.fromOffset(10,9)
+label.BackgroundTransparency=1
+label.TextColor3=Color3.fromRGB(255,235,247)
+label.TextXAlignment=Enum.TextXAlignment.Left
+label.TextYAlignment=Enum.TextYAlignment.Top
+label.TextWrapped=true
+label.Font=Enum.Font.Code
+label.TextSize=13
+label.Text="DQR ONE-CLICK BOOT CHECK"
+label.Parent=frame
+local close=Instance.new("TextButton")
+close.Size=UDim2.fromOffset(115,34)
+close.Position=UDim2.new(1,-125,1,-41)
+close.Text="CLOSE"
+close.BackgroundColor3=Color3.fromRGB(205,54,135)
+close.TextColor3=Color3.new(1,1,1)
+close.Font=Enum.Font.GothamBold
+close.TextSize=12
+close.Parent=frame
+close.MouseButton1Click:Connect(function() gui:Destroy() end)
+local lines={}
+local function show(message)
+    local s=tostring(message)
+    print("[DQR BOOT] "..s)
+    table.insert(lines,s)
+    if #lines>10 then table.remove(lines,1) end
+    if label.Parent then label.Text=table.concat(lines,"\n") end
 end
-
-local active, running = true, false
-local epoch = 0
-local connections = {}
-local enemies, hazards, gateParts = {}, {}, {}
-local logs, announced = {}, {}
-local scanBusy = false
-local cfg = {
-    autoSkill = true, autoMove = true, dodge = true,
-    faceEnemy = true, lookMechanic = true,
-    autoRespawn = true, nextRoom = true,
-    qCooldown = 6, qToE = 0.28, eRepeat = 0.55,
-    buffWindow = 4.0, castRange = 54, standoff = 30,
-    planningHorizon = 1.5, planningDt = 0.15,
-    warningScore = 13
-}
-local motorMode = 'MOVE'  -- optional fallback to MOVETO
-local moveDirection = Vector3.zero
-local moveGoal = nil
-local mode = 'READY'
-local target, targetDistance = nil, math.huge
-local healthLoss, lastHealth = 0, nil
-local discoveredAttacks, liveThreats = 0, {}
-local riskNow, riskSoon = 0, 0
-local threatName = 'NONE'
-local dodgePlan, dodgeCommitUntil = nil, 0
-local dodgeAt, dodgeCount = 0, 0
-local path = {token = 0, points = {}, index = 1, goal = nil, mode = nil, pending = false, requestedAt = 0}
-local lastQ, buffUntil, nextE = -math.huge, 0, math.huge
-local qCount, eCount, keyBusy = 0, 0, false
-local respawning, sawEnemy, lastEnemyAt = false, false, 0
-local lastRoomScan, lastVictoryScan, roomState, gateVisitCount = 0, 0, 'WAITING', 0
-local visitedGates = setmetatable({}, {__mode='k'})
-local currentGate = nil
-local gaze = {active = false, toward = false, source = nil, untilAt = 0}
-local rotatingRoot, facingAlign, facingAttachment, originalAutoRotate
-local controls, controlsLocked
-local manualTest = {untilAt = 0, beginPos = nil, direction = Vector3.zero, issued = false}
-local lastStuckAt, lastStuckPosition = 0, nil
-
-local function connect(signal, handler)
-    local c = signal:Connect(handler)
-    connections[#connections+1] = c
-    return c
+show("1. Pink UI: OK")
+show("2. loadstring: "..type(loadstring))
+if type(loadstring)~="function" then
+    show("STOP: Delta has no loadstring in this session.")
+    return
 end
-local function character()
-    local c = player.Character
-    if not c then return end
-    local h = c:FindFirstChildOfClass('Humanoid')
-    local r = c:FindFirstChild('HumanoidRootPart')
-    if h and r and h.Health > 0 then return c,h,r end
+local url="https://raw.githubusercontent.com/pemuladariindo/rahasia/main/main.lua?fix=10121"
+show("3. Downloading GitHub...")
+local fetched,source=pcall(function() return game:HttpGet(url) end)
+if not fetched then
+    show("HTTP ERROR: "..tostring(source):sub(1,170))
+    return
 end
-local function lower(s) return string.lower(tostring(s or '')) end
-local function has(s, frag) return string.find(lower(s), frag, 1, true) ~= nil end
-local function flat(v)
+if type(source)~="string" then show("INVALID HTTP DATA") return end
+show("4. Source size: "..#source.." bytes")
+if not source:find("GILDED HUB V10.1",1,true) then
+    show("WRONG VERSION / FILE. GitHub main.lua is not V10.1.")
+    return
+end
+show("5. V10.1 confirmed")
+local compiled,fn,why=pcall(loadstring,source)
+if not compiled or type(fn)~="function" then
+    show("COMPILE ERROR: "..tostring(compiled and why or fn):sub(1,180))
+    return
+end
+show("6. Compile OK; launching...")
+local monitor=game:GetService("LogService").MessageOut:Connect(function(message)
+    if tostring(message):find("[GS101] STARTUP ERROR",1,true) then
+        show("MAIN ERROR: "..tostring(message):sub(1,160))
+    end
+end)
+local ok,err=pcall(fn)
+if not ok then show("RUNTIME ERROR: "..tostring(err):sub(1,180)) return end
+task.wait(0.5)
+if pg:FindFirstChild("GildedHubV101") then
+    show("7. SUCCESS: AUTO DUNGEON GUI FOUND!")
+    show("Close this panel; tap START AUTO DUNGEON.")
+else
+    show("7. MAIN GUI MISSING; see MAIN ERROR above.")
+end
