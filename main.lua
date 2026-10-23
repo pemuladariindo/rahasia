@@ -1,9 +1,13 @@
 --[[
-DQR GILDED V12 - HARVARD / SAVE CONFIG / AUTO-EXECUTE
+DQR GILDED V15 - HARVARD / SPEED 21 / MOB DODGE
 Run this complete file once. It saves its bundled engine in the executor's local
 workspace and runs it. No HTTP downloads or external code are used.
 
 Harvard > Autofarm:
+- Speed 21 (experimental, ON): normal farming target 21; no separate burst
+  No verified anti-cheat-safe threshold. OFF uses game speed.
+  A game speed change yields the override until respawn instead of resetting it.
+- Mob dodge assist (ON): regular mobs only
 - Save config now / Load saved config
 - Auto-execute after teleport (ON by default)
 - Copy AutoExec loader (optional: add to the executor's startup AutoExec feature)
@@ -23,7 +27,7 @@ local env = type(getgenv) == "function" and getgenv() or _G
 local payload = [=====[
 -- DQR_HARVARD_RUNTIME_V12
 --[[
-DQR HARVARD V12 RUNTIME
+DQR HARVARD V15 RUNTIME
 All 18 user-supplied reference components; Harvard menu only.
 Per-account save/load, autosave and teleport auto-execute are available in Autofarm.
 This local cached engine is installed by DQR_Gilded_V12_AutoExec.lua.
@@ -176,7 +180,7 @@ local ok, result = pcall(function()
         task.wait(0.1)
         localPlayer = players.LocalPlayer
     end
-    assert(localPlayer, "LocalPlayer is not ready; run the complete V12 file again")
+    assert(localPlayer, "LocalPlayer is not ready; run the complete script file again")
     local user = tostring(localPlayer.UserId)
     local configPath = "DQR_GildedV10/configs/release_" .. user .. ".json"
     local hasConfig, configText = pcall(readfile, configPath)
@@ -188,7 +192,7 @@ local ok, result = pcall(function()
     end
     local source = readfile("DQR_GildedV10/runtime/harvard_v12_engine.lua")
     assert(type(source) == "string" and source:find("-- DQR_HARVARD_RUNTIME_V12", 1, true) == 1,
-        "Cached V12 engine is missing or outdated; run the complete V12 file once")
+        "Cached V12 engine is missing or outdated; run the complete script file once")
     assert(type(loadstring) == "function", "Executor loadstring is unavailable")
     local run, compileError = loadstring(source, "@DQR_Harvard_V12")
     assert(run, tostring(compileError))
@@ -257,7 +261,7 @@ local function installHarvardPersistence(context)
         elseif state.stopped or rt.destroyed then state.status = "Stopped"
         elseif not queueFunction() then state.status = "Executor has no teleport queue"
         elseif not filesAvailable() then state.status = "Executor file APIs unavailable"
-        elseif not sourceAvailable() then state.status = "Run the complete V12 file once"
+        elseif not sourceAvailable() then state.status = "Run the complete script file once"
         elseif state.queueError then state.status = "Queue failed: " .. state.queueError
         elseif state.pending then state.status = "Queued for the next server"
         else state.status = "Ready for teleport" end
@@ -346,6 +350,278 @@ local function installHarvardPersistence(context)
         if now - lastStatus >= 2 then lastStatus = now; state.refresh() end
     end)
     table.insert(context.sliderConnections, state.statusConnection)
+end
+
+-- A local, timed escape planner used only outside boss encounters.
+local function installMobReflex(context)
+    local cfg, rt, rd = context.CFG, context.RT, context.RD
+    local state = {active=false, mode="IDLE", zones={}, raw={}, lastRead=-math.huge,
+        lastPlan=-math.huge, goal=nil, plans=0, fallbackParts={}, lastParts=-math.huge}
+    context.mobDodge = state
+    if cfg.harvardMobDodge == nil then cfg.harvardMobDodge = true end
+    local found=false
+    for _,key in ipairs(context.PERSIST or {}) do if key=="harvardMobDodge" then found=true end end
+    if not found then table.insert(context.PERSIST,"harvardMobDodge") end
+    local abs,min,max,sqrt = math.abs,math.min,math.max,math.sqrt
+    local known = { ["gs swing"]=true,["gs kcircle"]=true,["gs beam"]=true,
+        dracanimageattack=true,dracaniwarriorhitbox=true,dracaniknightcircle=true,
+        dracanicfamiliarhitbox=true,northernmageshot=true,northernwarriorlinestrike=true,
+        northernwarriorcirclestrike=true,spearmanstrikehitbox=true }
+    local function distance(a,b) return sqrt((a.X-b.X)^2+(a.Z-b.Z)^2) end
+    local function alive(e) return e.root and e.root.Parent and e.humanoid and e.humanoid.Health>0 end
+    local function bossNear(origin)
+        local target=context.BR and context.BR.target
+        if target and target.isBoss then return true end
+        if rt.gsLookOn or rd.safeField and (rd.safeField.untilAt or 0)>os.clock() then return true end
+        for _,e in ipairs(rd.enemies or {}) do
+            if e.isBoss and alive(e) and distance(origin,e.root.Position)<180 then return true end
+        end
+        return false
+    end
+    local function clearState(mode)
+        state.active=false; state.goal=nil; state.mode=mode or "IDLE"
+        rt.mobDodgeUntil=nil
+    end
+    local function depth(zone,p,at,halfHeight)
+        local cx,cy,cz=zone.cx,zone.cy,zone.cz
+        local ax,az,bx,bz,ha,hb=zone.ax,zone.az,zone.bx,zone.bz,zone.ha,zone.hb
+        if zone.moving then
+            local along=(zone.offset or 0)+(zone.speed or 0)*max(at-(zone.pathStart or at),0)
+            if zone.endAlong then along=min(along,zone.endAlong) end
+            cx,cy,cz=(zone.ox or cx)+(zone.dx or 0)*along,zone.oy or cy,(zone.oz or cz)+(zone.dz or 0)*along
+            ax,az=zone.dx or 1,zone.dz or 0; bx,bz=-az,ax
+            ha,hb=zone.halfL,zone.halfW
+        end
+        if not cx or not cz then return -math.huge end
+        if not zone.ground and cy and abs(p.Y-cy)>(zone.hy or zone.halfH or 3)+halfHeight then return -math.huge end
+        local x,z=p.X-cx,p.Z-cz
+        if zone.r then return zone.r-sqrt(x*x+z*z) end
+        if not (ax and az and bx and bz and ha and hb) then return -math.huge end
+        local da,db=abs(x*ax+z*az)-ha,abs(x*bx+z*bz)-hb
+        if da<=0 and db<=0 then return -max(da,db) end
+        return -sqrt(max(da,0)^2+max(db,0)^2)
+    end
+    state.depth=depth
+
+    local function isMarker(part)
+        if not part:IsA("BasePart") or part.CanCollide or part.Transparency>=0.95 then return false end
+        local name=string.lower(part.Name.." "..(part.Parent and part.Parent.Name or ""))
+        if name:find("safe",1,true) or name:find("heal",1,true) then return false end
+        local size=part.Size
+        if max(size.X,size.Y,size.Z)<8 then return false end
+        local named=name:find("precast",1,true) or name:find("telegraph",1,true)
+            or name:find("hitbox",1,true) or name:find("attack",1,true)
+        local color=part.Color
+        return named~=nil or part.Name=="Part" and color.R>0.8 and color.G<0.45 and color.B<0.45
+    end
+    local function collect(now,origin)
+        if now-state.lastRead<0.065 then return end
+        state.lastRead=now; table.clear(state.zones)
+        if context.hazards then
+            local zones=context.hazards(now,state.raw) or {}
+            for _,zone in ipairs(zones) do
+                if known[string.lower(tostring(zone.name or ""))]
+                    and (zone.untilAt or now+1)>now then
+                    state.zones[#state.zones+1]=zone
+                end
+            end
+        end
+        -- Fallback for renamed/generic telegraph parts under known REGULAR mobs.
+        -- It never inspects boss models, scenery, player spells or safe markers.
+        if now-state.lastParts>=0.25 then
+            state.lastParts=now; table.clear(state.fallbackParts)
+            for _,e in ipairs(rd.enemies or {}) do
+                if not e.isBoss and alive(e) and e.model and distance(origin,e.root.Position)<85 then
+                    local descendants=e.model:GetDescendants()
+                    for _,part in ipairs(descendants) do
+                        if isMarker(part) then state.fallbackParts[#state.fallbackParts+1]=part end
+                    end
+                end
+            end
+        end
+        local alreadyTracked={}
+        for _,data in pairs(rd.models or {}) do
+            if data.hb then alreadyTracked[data.hb]=true end
+            if data.pc then alreadyTracked[data.pc]=true end
+            for _,part in ipairs(data.hbs or {}) do alreadyTracked[part]=true end
+            for _,part in ipairs(data.pcs or {}) do alreadyTracked[part]=true end
+        end
+        for _,part in ipairs(state.fallbackParts) do
+            if part.Parent and isMarker(part) and context.footprint then
+                local tracked=rd.models and rd.models[part]
+                if not tracked and not alreadyTracked[part] then
+                    local zone={name="mob telegraph",from=now,untilAt=now+0.2,ground=true}
+                    local cylinder=part:IsA("Part") and part.Shape==Enum.PartType.Cylinder
+                    context.footprint(zone,part.CFrame,part.Size,false,cylinder)
+                    state.zones[#state.zones+1]=zone
+                end
+            end
+        end
+    end
+    local function risk(p,now,delta,reach,height,lead)
+        local total,strongest,strongestValue=0,nil,0
+        for _,zone in ipairs(state.zones) do
+            local at=now+delta
+            if at<=(zone.untilAt or at+1) and at>=(zone.from or now)-lead then
+                local d=depth(zone,p,at,height)+reach
+                if d>0 then
+                    local value=1+min(d,30)/30
+                    total+=value
+                    if value>strongestValue then strongest,strongestValue=zone,value end
+                end
+            end
+        end
+        return total,strongest
+    end
+    state.risk=risk
+    local function floorAt(point,origin,feet,params)
+        local hit=context.Workspace:Raycast(Vector3.new(point.X,origin.Y+8,point.Z),Vector3.new(0,-24,0),params)
+        if not hit or hit.Normal.Y<0.65 or abs(hit.Position.Y-(origin.Y-feet))>6 then return nil end
+        return Vector3.new(point.X,hit.Position.Y+feet,point.Z)
+    end
+    local function clearRoute(origin,goal,root,params,feet)
+        local size=Vector3.new(max(root.Size.X+0.6,2.5),max(root.Size.Y+1,3),max(root.Size.Z+0.6,2.5))
+        if context.Workspace:Blockcast(CFrame.new(origin),size,goal-origin,params) then return false end
+        local steps=max(1,math.ceil(distance(origin,goal)/3))
+        for i=1,steps do
+            if not floorAt(origin:Lerp(goal,i/steps),origin,feet,params) then return false end
+        end
+        return true
+    end
+    local function crowd(p,eta)
+        local score=0
+        for _,e in ipairs(rd.enemies or {}) do
+            if not e.isBoss and alive(e) then
+                local pos=e.root.Position
+                local x,z=pos.X+(e.vx or 0)*min(eta,0.5),pos.Z+(e.vz or 0)*min(eta,0.5)
+                local gap=sqrt((p.X-x)^2+(p.Z-z)^2)
+                local keep=(e.extent or 3)+(e.melee and min(e.meleeDistance or 4,12) or 3)+2
+                if gap<keep then score+=(keep-gap)/keep end
+            end
+        end
+        return score
+    end
+    local function routeScore(origin,goal,now,speed,reach,height,lead)
+        local length=distance(origin,goal)
+        local eta=length/speed
+        local endRisk=max((risk(goal,now,eta,reach,height,lead)),(risk(goal,now,lead,reach,height,0.1)))
+        local routeRisk,newCross=0,0
+        for i=1,5 do
+            local fraction=i/5
+            local p=origin:Lerp(goal,fraction)
+            routeRisk+=risk(p,now,eta*fraction,reach,height,0.08)
+            for _,zone in ipairs(state.zones) do
+                local at=now+eta*fraction
+                if at>=(zone.from or now)-0.08 and at<=(zone.untilAt or at+1)
+                    and depth(zone,origin,now,height)+reach<=0
+                    and depth(zone,p,at,height)+reach>0 then newCross+=1 end
+            end
+            routeRisk+=crowd(p,eta*fraction)*0.8
+        end
+        local turn=0
+        if state.goal then
+            local a,b=goal-origin,state.goal-origin
+            if a.Magnitude>0.1 and b.Magnitude>0.1 then turn=(1-a.Unit:Dot(b.Unit))*5 end
+        end
+        return endRisk*160+routeRisk*24+newCross*100+eta*4+turn,endRisk,newCross
+    end
+    state.routeScore=routeScore
+    local function choose(origin,root,hum,now,reach,height,lead,strongest,baseline)
+        local params=context.raycastParams()
+        local feet=hum.HipHeight+root.Size.Y*0.5
+        local speed=max(tonumber(hum.WalkSpeed) or 16,1)
+        local points={}
+        if strongest and not strongest.moving then
+            if strongest.r then
+                local away=Vector3.new(origin.X-strongest.cx,0,origin.Z-strongest.cz)
+                if away.Magnitude>0.1 then
+                    points[#points+1]=origin+away.Unit*(depth(strongest,origin,now,height)+reach+3)
+                end
+            elseif strongest.ha and strongest.hb then
+                local ax,az,half=strongest.ax,strongest.az,strongest.ha
+                if strongest.hb<strongest.ha then ax,az,half=strongest.bx,strongest.bz,strongest.hb end
+                local projection=(origin.X-strongest.cx)*ax+(origin.Z-strongest.cz)*az
+                for _,side in ipairs({projection>=0 and 1 or -1,projection>=0 and -1 or 1}) do
+                    points[#points+1]=origin+Vector3.new(ax,0,az)*(side*(half+reach+3)-projection)
+                end
+            end
+        end
+        for _,radius in ipairs({9,16,25}) do
+            for i=0,7 do
+                local angle=i*math.pi/4
+                points[#points+1]=origin+Vector3.new(math.cos(angle)*radius,0,math.sin(angle)*radius)
+            end
+        end
+        local best,bestScore,bestRisk=nil,math.huge,math.huge
+        local started=os.clock()
+        for _,raw in ipairs(points) do
+            local goal=floorAt(raw,origin,feet,params)
+            if goal and distance(origin,goal)>2 and clearRoute(origin,goal,root,params,feet) then
+                local score,endRisk,newCross=routeScore(origin,goal,now,speed,reach,height,lead)
+                if newCross==0 and endRisk<baseline-0.05 and score<bestScore then best,bestScore,bestRisk=goal,score,endRisk end
+            end
+            if best and os.clock()-started>0.0025 then break end
+        end
+        return best,bestRisk
+    end
+    function context.mobReflexTick(now)
+        if not cfg.harvardMobDodge or not rt.farmEnabled or rt.destroyed or rt.modHalt then clearState(); return false end
+        local char,hum,root=context.character()
+        if not root or not hum or hum.Health<=0 or hum.WalkSpeed<=0.1 or not context.mobReflexDrive then clearState(); return false end
+        local origin=root.Position
+        if bossNear(origin) then clearState("BOSS"); return false end
+        local dungeon=context.Workspace:FindFirstChild("dungeonName")
+        if game.PlaceId~=101088859550383 and not (dungeon and dungeon.Value=="Gilded Skies") then clearState(); return false end
+        if context.pinnedBy and context.pinnedBy(char) then clearState("STUNNED"); return false end
+        collect(now,origin)
+        local reach=max(root.Size.X,root.Size.Z)*0.5+1.3
+        local height=hum.HipHeight+root.Size.Y*0.5
+        local speed=max(tonumber(hum.WalkSpeed) or 16,1)
+        local lead=min(0.8,0.4+(tonumber(rt.pingS) or 0)*1.5)
+        for _,zone in ipairs(state.zones) do
+            local inside=depth(zone,origin,now,height)+reach
+            if inside>0 then lead=min(1.4,max(lead,inside/speed+(tonumber(rt.pingS) or 0)+0.15)) end
+        end
+        local baseline,strongest=risk(origin,now,0,reach,height,lead)
+        local velocity=root.AssemblyLinearVelocity or Vector3.zero
+        local flat=Vector3.new(velocity.X,0,velocity.Z)
+        if flat.Magnitude>speed then flat=flat.Unit*speed end
+        local ahead,aheadZone=risk(origin+flat*lead,now,lead,reach,height,0.12)
+        if ahead>baseline then baseline,strongest=ahead,aheadZone end
+        local reached=state.goal and distance(origin,state.goal)<2.5
+        if baseline<=0 then
+            if not state.active or reached or now>(state.holdUntil or 0) then clearState(); return false end
+        end
+        local goalRisk=state.goal and max((risk(state.goal,now,distance(origin,state.goal)/speed,reach,height,lead)),(risk(state.goal,now,lead,reach,height,0.1))) or math.huge
+        local newCross=0
+        if state.goal then local _,_,cross=routeScore(origin,state.goal,now,speed,reach,height,lead); newCross=cross end
+        local replan=not state.goal or goalRisk>0.05 or newCross>0 or reached
+        if replan and (not state.goal or goalRisk>0.05 or newCross>0 or now-state.lastPlan>=0.075) then
+            state.lastPlan=now
+            local goal,newRisk=choose(origin,root,hum,now,reach,height,lead,strongest,max(baseline,0.1))
+            if not goal then clearState("LEGACY FALLBACK"); return false end
+            state.goal=goal; goalRisk=newRisk; state.holdUntil=now+0.3; state.plans+=1
+        end
+        if not state.goal then clearState(); return false end
+        if state.goal then
+            state.active=true; state.mode=strongest and tostring(strongest.name) or "CLEARING"
+            rt.mobDodgeUntil=now+0.12; rt.brainNow=now
+            context.mobReflexDrive(hum,root,state.goal,now)
+            if context.setState then context.setState("MOB DODGE: "..state.mode) end
+            return true
+        end
+        clearState(); return false
+    end
+    local attackAllowed=context.attackAllowedBySkill
+    if attackAllowed then
+        context.attackAllowedBySkill=function(now)
+            if state.active and (rt.mobDodgeUntil or 0)>now then
+                local _,_,root=context.character()
+                if root and not bossNear(root.Position) then return false,"mob dodge" end
+            end
+            return attackAllowed(now)
+        end
+    end
 end
 
 local components = {}
@@ -8053,107 +8329,96 @@ components.gearProfiles = function(context)
 end
 
 components.movementBoost = function(context)
-    local config, runtimeState = context.CFG, context.RT
-    local localPlayer, config2 =
-        context.LocalPlayer, { TargetSpeed = 24, MinSpeed = 18, MaxSpeed = 26, FallbackSpeed = 16 }
-    local sharedValue = localPlayer.Character
-    local sharedValue2, sharedValue3, sharedValue4, moverHeading =
-        sharedValue and (sharedValue:FindFirstChildOfClass("Humanoid")), false
-    local function helper()
-        if sharedValue then
-            if sharedValue.Parent then
-                if sharedValue2 then
-                    if sharedValue2.Parent then
-                        return true
-                    end
-                end
-            end
-        end
-        sharedValue = localPlayer.Character
-        sharedValue2 = sharedValue and sharedValue:FindFirstChildOfClass("Humanoid")
-        local value = sharedValue2
-        return value ~= nil
+    -- One fixed target for normal farming. No separate sprint/burst speed.
+    local cfg, rt = context.CFG, context.RT
+    local TARGET = 21
+    local attached, baseline, owned, yielded, stopped = nil, nil, false, false, false
+    local status = "Waiting for character"
+    if cfg.harvardSpeed21 == nil then cfg.harvardSpeed21 = true end
+    local function speedOf(humanoid)
+        local value = tonumber(humanoid and humanoid.WalkSpeed)
+        return value and value == value and value < math.huge and math.max(value, 0) or 0
     end
-    local function steer(moverHeading2)
-        moverHeading = moverHeading2
-        runtimeState.moverHeading = moverHeading2
+    local function release()
+        if owned and attached and attached.Parent and baseline
+            and math.abs(speedOf(attached) - TARGET) < 0.01 then
+            -- Restore only our own unchanged value; never overwrite a new game value.
+            pcall(function() attached.WalkSpeed = baseline end)
+        end
+        owned = false
     end
-    local sharedValue5 = config2.TargetSpeed
-    local function helper2(argument)
-        if not (helper()) then
-            local value = sharedValue5
-            return value
+    local function tick(_requestedHumanoid)
+        local character = context.LocalPlayer.Character
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        if humanoid ~= attached then
+            release()
+            attached, baseline, owned, yielded = humanoid, speedOf(humanoid), false, false
         end
-        local locomotionSpeed =
-            math.clamp(tonumber(argument) or config2.TargetSpeed, config2.MinSpeed, config2.MaxSpeed)
-        if sharedValue3 then
-            if math.abs(locomotionSpeed - sharedValue5) >= 2 then
-                sharedValue5 = locomotionSpeed
-            end
-            if sharedValue2.WalkSpeed ~= sharedValue5 then
-                sharedValue2.WalkSpeed = sharedValue5
-            end
-            runtimeState.locomotionSpeed = sharedValue5
-            argument = sharedValue5
-            return argument
+        if not humanoid or not humanoid.Parent then
+            status = "Waiting for character"
+            return 0
         end
-        sharedValue3, sharedValue5 = true, locomotionSpeed
-        sharedValue4 = sharedValue2.WalkSpeed > 0 and sharedValue2.WalkSpeed or nil
-        sharedValue2.WalkSpeed = sharedValue5
-        locomotionSpeed = nil
-        locomotionSpeed, runtimeState.locomotion = sharedValue5, true
-        runtimeState.locomotionSpeed = locomotionSpeed
-        argument = sharedValue5
-        return argument
+        local current = speedOf(humanoid)
+        if owned and math.abs(current - TARGET) >= 0.01 then
+            -- Yield for this character when the game supplies another speed.
+            -- Do not keep resetting a correction, buff, slow or stun.
+            owned, yielded, baseline = false, true, current
+        end
+        if stopped or rt.destroyed or not rt.farmEnabled or cfg.harvardSpeed21 == false or rt.modHalt then
+            release()
+            status = "Game speed"
+            return speedOf(humanoid)
+        end
+        if yielded then
+            status = "Game changed speed; using game speed until respawn"
+            return current
+        end
+        local pinned = context.pinnedBy and context.pinnedBy(character)
+        local buffed = context.speedAbilityOn and context.speedAbilityOn(os.clock())
+        if humanoid.Health <= 0 or humanoid.PlatformStand or humanoid.Sit
+            or current < 16 or pinned or buffed then
+            release()
+            status = "Game speed (buff, slow or stun)"
+            return speedOf(humanoid)
+        end
+        if not owned then
+            baseline = current
+            -- Speeds above 21 belong to the game (for example a real buff).
+            if current < TARGET then
+                local ok = pcall(function() humanoid.WalkSpeed = TARGET end)
+                owned = ok and math.abs(speedOf(humanoid) - TARGET) < 0.01
+                if not owned then yielded = true end
+            end
+        end
+        status = owned and "Target 21; no burst" or "Game speed"
+        return speedOf(humanoid)
     end
     local function off()
-        moverHeading = nil
-        runtimeState.moverHeading = nil
-        if not sharedValue3 then
-            return
-        end
-        sharedValue3 = false
-        runtimeState.locomotion = false
-        runtimeState.locomotionSpeed = nil
-        if helper() then
-            local humanoid = sharedValue2
-            humanoid.WalkSpeed = sharedValue4 or config2.FallbackSpeed
-        end
-        sharedValue4 = nil
+        rt.moverHeading = nil
+        rt.locomotion = false
+        rt.locomotionSpeed = nil
     end
-    local connection = localPlayer.CharacterAdded:Connect(function(argument)
-        sharedValue = argument
-        sharedValue2, sharedValue3, sharedValue4, moverHeading =
-            argument:FindFirstChildOfClass("Humanoid"), false, nil, nil
-        runtimeState.moverHeading = nil
-        runtimeState.locomotion = false
-        runtimeState.locomotionSpeed = nil
-    end)
-    local function stop()
-        off()
-        if connection then
-            connection:Disconnect()
-            connection = nil
-        end
+    context.harvardSetSpeed21 = function(enabled)
+        cfg.harvardSpeed21 = enabled == true
+        if not enabled then release() end
+        if context.speedApply then context.speedApply() else tick() end
     end
+    context.harvardSpeed21Status = function() return status end
     context.LC = {
-        on = helper2,
+        CONFIG = {TargetSpeed=TARGET,MinSpeed=0,MaxSpeed=TARGET,FallbackSpeed=16},
+        tick = tick,
+        on = function(_requestedSpeed) return tick() end,
         off = off,
-        steer = steer,
-        stop = stop,
-        CONFIG = config2,
-        active = function()
-            return false
-        end,
-        boosted = function()
-            local value = sharedValue3
-            return value
-        end,
+        stop = function() stopped=true; release(); off() end,
+        steer = function(direction) rt.moverHeading=direction end,
+        active = function() return false end,
+        boosted = function() return false end,
         speed = function()
-            local value = sharedValue3 and sharedValue5 or nil
-            return value
+            local character = context.LocalPlayer.Character
+            return speedOf(character and character:FindFirstChildOfClass("Humanoid"))
         end,
     }
+    off()
 end
 
 components.hazardReader = function(context)
@@ -51989,7 +52254,7 @@ components.movementCombat = function(context)
         return sqrt(value * value + value2 * value2)
     end
     local function getMovementSpeed()
-        return capturedContext[2].walkSpeed or capturedContext[1].tweenWalk
+        return context.speedApply()
     end
     local function setControlsEnabled(argument)
         local controlsAt, controlsOff, controlsOff2 = os.clock(), movement.controlsOff, not argument
@@ -52045,64 +52310,55 @@ components.movementCombat = function(context)
         capturedContext[12] = #capturedContext[3].connections + 1
         capturedContext[11][capturedContext[12]] = sharedValue
     end
+    -- Planning reads the resulting speed. The fixed-21 controller is the
+    -- only speed writer; legacy custom/burst values cannot raise its target.
     context.SPEED_KEYS = {
-        "burstMax",
-        "tweenSprint",
-        "tweenSlam",
-        "slamBurstMax",
-        "finishRushSpeed",
-        "respawnRushBurst",
-        "mageBurstMax",
+        "burstMax", "tweenSprint", "tweenSlam", "slamBurstMax",
+        "finishRushSpeed", "respawnRushBurst", "mageBurstMax",
     }
     context.SPEED_UPTO = { "homeBurst", "travelBurstSpeed", "tweenEscape" }
-    context.speedCustomOn = function()
-        return true
-    end
-    context.speedNormal = function()
-        return 23
-    end
-    context.speedBurst = function()
-        return 30
-    end
-    context.speedApply = function()
-        local value = {}
-        local speedSnap, value2 = capturedContext[2].speedSnap, context.LC and context.LC.CONFIG
-        if context.speedCustomOn() then
-            if not speedSnap then
-                speedSnap = { lc = {} }
-                if value2 then
-                    speedSnap.lc = { FallbackSpeed = value2.FallbackSpeed }
-                end
-                value[1] = capturedContext[2]
-                value[1].speedSnap = speedSnap
-            end
-            if value2 then
-                value2.FallbackSpeed = context.speedNormal()
-            end
-        elseif speedSnap then
-            for index, key in ipairs(context.SPEED_KEYS) do
-                if speedSnap[key] ~= nil then
-                    value[2] = capturedContext[1]
-                    value[3] = speedSnap[key]
-                    value[2][key] = value[3]
-                end
-            end
-            for index2, entry in ipairs(context.SPEED_UPTO) do
-                if speedSnap[entry] ~= nil then
-                    value[4] = capturedContext[1]
-                    value[5] = speedSnap[entry]
-                    value[4][entry] = value[5]
-                end
-            end
-            if value2 and speedSnap.lc then
-                for key2, entry2 in pairs(speedSnap.lc) do
-                    value2[key2] = entry2
-                end
-            end
-            value[6] = capturedContext[2]
-            value[6].speedSnap = nil
+    local gameSpeedPlanKeys = {
+        "tweenWalk", "burstMax", "tweenSprint", "tweenSlam", "slamBurstMax",
+        "finishRushSpeed", "respawnRushBurst", "mageBurstMax", "homeBurst",
+        "travelBurstSpeed", "tweenEscape", "buffSpeed", "speedCap", "orbitSpeed",
+        "runOnSpeed", "mageStrafeSpeed", "candySpeed", "lagBackWalk",
+    }
+    context.gameSpeedNow = function(humanoid)
+        if not humanoid then
+            local character = localPlayer.Character
+            humanoid = character and character:FindFirstChildOfClass("Humanoid")
         end
+        local speed = tonumber(humanoid and humanoid.WalkSpeed)
+        if speed == nil then return 16 end -- prediction fallback, no character
+        if speed ~= speed or speed == math.huge or speed == -math.huge then return 0 end
+        return math.max(speed, 0)
     end
+    context.speedCustomOn = function() return false end
+    context.speedNormal = function() return math.max(context.gameSpeedNow(), 0.1) end
+    context.speedBurst = context.speedNormal
+    context.speedApply = function(humanoid)
+        if context.LC and context.LC.tick then context.LC.tick(humanoid) end
+        local actual = context.gameSpeedNow(humanoid)
+        local planning = math.max(actual, 0.1) -- avoid division by zero while stunned
+        local config, runtime = capturedContext[1], capturedContext[2]
+        config.speedCustom = false
+        config.buffSpeedSet = false
+        config.unbuffedBurstNL = false
+        config.unbuffedBurstBelowNL = false
+        config.speedNormal, config.speedBurst = actual, actual
+        for _, key in ipairs(gameSpeedPlanKeys) do config[key] = planning end
+        runtime.walkSpeed = planning
+        runtime.walkSpeedBefore = nil
+        runtime.speedSnap = nil
+        runtime.speedBuffHeld = nil
+        runtime.locomotion = false
+        runtime.locomotionSpeed = nil
+        movement.ourWalkSpeed = nil
+        movement.boostSince = nil
+
+        return planning
+    end
+    context.speedApply()
     context.speedAbilityOn = function(argument)
         argument = argument or os.clock()
         local success, value = pcall(context.buffState, argument)
@@ -52133,127 +52389,12 @@ components.movementCombat = function(context)
         end
         return false
     end
+
     context.walkNormal = function(humanoid)
-        if context.speedCustomOn() then
-            return context.speedNormal()
-        end
-        return math.min(humanoid and humanoid.WalkSpeed or 16, capturedContext[1].tweenWalk or 16)
+        return math.max(context.gameSpeedNow(humanoid), 0.1)
     end
     context.speedHoldTick = function()
-        local value = {}
-        if
-            tostring(capturedContext[1].speedCustom)
-                .. ":"
-                .. tostring(capturedContext[1].speedNormal)
-                .. ":"
-                .. tostring(capturedContext[1].speedBurst)
-                .. ":"
-                .. tostring(capturedContext[1].burstMax)
-            ~= capturedContext[2].speedSig
-        then
-            pcall(context.speedApply)
-            value[1] = capturedContext[2]
-            value[2] = tostring(capturedContext[1].speedCustom)
-                .. ":"
-                .. tostring(capturedContext[1].speedNormal)
-                .. ":"
-                .. tostring(capturedContext[1].speedBurst)
-                .. ":"
-                .. tostring(capturedContext[1].burstMax)
-            value[1].speedSig = value[2]
-        end
-        if context.lagBackOn and context.lagBackOn() then
-            if not capturedContext[2].lagBackRestored then
-                value[3] = capturedContext[2]
-                value[3].lagBackRestored = true
-                local character = localPlayer.Character
-                local humanoid = character and (character:FindFirstChildOfClass("Humanoid"))
-                if humanoid and humanoid.Health > 0 then
-                    local walkSpeed = context.speedAbilityOn
-                            and context.speedAbilityOn(os.clock())
-                            and (capturedContext[2].gameBuffWS or 24)
-                        or (capturedContext[1].lagBackWalk or 16)
-                    if humanoid.WalkSpeed > walkSpeed + 0.01 then
-                        pcall(function()
-                            humanoid.WalkSpeed = walkSpeed
-                        end)
-                    end
-                end
-                movement.ourWalkSpeed = nil
-                value[4] = capturedContext[2]
-                value[4].speedBuffHeld = nil
-            end
-            if
-                capturedContext[1].lagBackNormal ~= false
-                and context.speedCustomOn()
-                and not (context.speedAbilityOn and context.speedAbilityOn(os.clock()))
-            then
-                local character2 = localPlayer.Character
-                local humanoid2 = character2 and (character2:FindFirstChildOfClass("Humanoid"))
-                if humanoid2 and humanoid2.Health > 0 then
-                    local value2 = context.speedNormal()
-                    if math.abs(humanoid2.WalkSpeed - value2) > 0.01 then
-                        pcall(function()
-                            humanoid2.WalkSpeed = value2
-                        end)
-                    end
-                    movement.ourWalkSpeed = value2
-                end
-            end
-            return
-        end
-        value[5] = capturedContext[2]
-        value[5].lagBackRestored = nil
-        local value3 = context.speedCustomOn()
-        if if value3 then capturedContext[2].destroyed else not value3 then
-            if capturedContext[2].speedBuffHeld then
-                value[6] = capturedContext[2]
-                value[6].speedBuffHeld = nil
-            end
-            return
-        end
-        value3 = localPlayer.Character
-        local humanoid3 = value3 and (value3:FindFirstChildOfClass("Humanoid"))
-        if humanoid3 and humanoid3.Health > 0 then
-            local walkSpeed2 = context.speedNormal()
-            local value4 = context.speedBurst()
-            if context.speedAbilityOn(os.clock()) then
-                if not capturedContext[2].speedBuffHeld then
-                    if math.abs(humanoid3.WalkSpeed - value4) > 0.01 then
-                        if math.abs(humanoid3.WalkSpeed - walkSpeed2) > 0.01 then
-                            if humanoid3.WalkSpeed > (capturedContext[1].tweenWalk or 16) + 0.5 then
-                                value[7] = capturedContext[2]
-                                value[8] = humanoid3.WalkSpeed
-                                value[7].gameBuffWS = value[8]
-                            end
-                        end
-                    end
-                end
-                if math.abs(humanoid3.WalkSpeed - value4) > 0.01 then
-                    pcall(function()
-                        humanoid3.WalkSpeed = value4
-                    end)
-                end
-                movement.ourWalkSpeed = value4
-                value[9] = capturedContext[2]
-                value[9].speedBuffHeld = true
-            else
-                if capturedContext[2].speedBuffHeld then
-                    value[10] = capturedContext[2]
-                    value[10].speedBuffHeld = nil
-                    if humanoid3.WalkSpeed > walkSpeed2 + 0.01 then
-                        pcall(function()
-                            humanoid3.WalkSpeed = walkSpeed2
-                        end)
-                    end
-                end
-                if humanoid3.WalkSpeed < walkSpeed2 - 0.01 then
-                    pcall(function()
-                        humanoid3.WalkSpeed = walkSpeed2
-                    end)
-                end
-            end
-        end
+        if not capturedContext[2].destroyed then context.speedApply() end
     end
     do
         local sharedValue2 = 0
@@ -52386,353 +52527,20 @@ components.movementCombat = function(context)
             value[7].lbHist = lbHist2
         end
     end
-    context.unbuffedOk = function(B)
-        if capturedContext[1].unbuffedBurstBelowNL == true then
-            return true
+
+    context.unbuffedOk = function(_now) return false end
+    local function helper(humanoid, wantsBurst, _requestedSpeed)
+        -- A game-provided skill may still be cast; its speed is never forced.
+        local now = os.clock()
+        if wantsBurst and context.buffPress
+            and context.buffHoldsSpeed and not context.buffHoldsSpeed(now) then
+            pcall(context.buffPress, now)
         end
-        if capturedContext[1].unbuffedBurstNL ~= true then
-            return false
-        end
-        return not (context.belowNL and context.belowNL())
+        context.speedApply(humanoid)
     end
-    local function helper(humanoid, argument, lastSpeed)
-        local value = {}
-        local value2 = os.clock()
-        local buffSpeedStamp = context.buffHoldsSpeed(value2)
-        if if buffSpeedStamp then not buffSpeedStamp else not context.unbuffedOk(value2) then
-            if argument then
-                if context.buffPress then
-                    pcall(context.buffPress, value2)
-                end
-            end
-            if movementBoost.active() then
-                movementBoost.off()
-            end
-            local value3 = capturedContext[2].walkSpeed or capturedContext[1].tweenWalk or 16
-            if humanoid.WalkSpeed > value3 + 0.5 then
-                pcall(function()
-                    humanoid.WalkSpeed = value3
-                end)
-            end
-            movement.ourWalkSpeed = value3
-            value[1] = capturedContext[2]
-            value[1].walkSpeedBefore = nil
-            movement.boostSince = nil
-            return
-        end
-        if context.buffHoldsSpeed(value2) then
-            buffSpeedStamp = capturedContext[2].buffPressedAt or capturedContext[3].buffHolderSeenAt or 0
-            if capturedContext[2].buffSpeedStamp ~= buffSpeedStamp then
-                value[2] = capturedContext[2]
-                value[2].buffSpeedStamp = buffSpeedStamp
-                if movementBoost.active() then
-                    movementBoost.off()
-                end
-                if
-                    capturedContext[1].buffSpeedSet == true
-                    and not (context.lagBackOn and context.lagBackOn())
-                then
-                    local value4 = math.min(
-                        capturedContext[1].buffSpeed or capturedContext[1].burstMax or 28,
-                        capturedContext[1].speedCap or 24
-                    )
-                    pcall(function()
-                        humanoid.WalkSpeed = value4
-                    end)
-                    movement.ourWalkSpeed = value4
-                    value[3] = capturedContext[2]
-                    value[3].walkSpeedBefore = nil
-                    movement.boostSince = nil
-                else
-                    movement.ourWalkSpeed = humanoid.WalkSpeed
-                    value[4] = capturedContext[2]
-                    value[4].walkSpeedBefore = nil
-                    movement.boostSince = nil
-                end
-                return
-            end
-            if movementBoost.active() then
-                local walkSpeed = humanoid.WalkSpeed
-                movementBoost.off()
-                if walkSpeed > 0 then
-                    if humanoid.WalkSpeed ~= walkSpeed then
-                        humanoid.WalkSpeed = walkSpeed
-                    end
-                end
-                movement.ourWalkSpeed = nil
-                value[5] = capturedContext[2]
-                value[5].walkSpeedBefore = nil
-                movement.boostSince = nil
-            end
-            return
-        end
-        buffSpeedStamp = humanoid.WalkSpeed
-        local lastRest, value5 = movement.ourWalkSpeed
-            and math.abs(buffSpeedStamp - movement.ourWalkSpeed) > 0.01
-        if lastRest then
-            local walkSpeedBefore = capturedContext[2].walkSpeedBefore
-            value5 = if walkSpeedBefore
-                then math.abs(buffSpeedStamp - capturedContext[2].walkSpeedBefore) > 0.01
-                else not walkSpeedBefore
-        else
-            value5 = lastRest
-        end
-        if value5 then
-            value[6] = movement
-            value[7] = buffSpeedStamp
-                        < (capturedContext[2].walkSpeedBefore or capturedContext[2].walkSpeed or capturedContext[1].tweenWalk) - 0.5
-                    and value2 + 2
-                or 0
-            value[6].foreignUntil = value[7]
-            movement.ourWalkSpeed = nil
-            value[8] = capturedContext[2]
-            value[8].walkSpeedBefore = nil
-        end
-        if
-            context.BB ~= nil and context.BB.lethal == true
-            or capturedContext[3].orbLead ~= nil
-            or capturedContext[2].bobAggroAt ~= nil and value2 - capturedContext[2].bobAggroAt < 0.3
-            or capturedContext[1].meleeBurst ~= false
-                and capturedContext[2].meleeEscapeAt ~= nil
-                and value2 - capturedContext[2].meleeEscapeAt < 0.3
-        then
-            value[9] = movement
-            value[10] = value2 + capturedContext[1].boostRelease
-            value[9].threatUntil = value[10]
-        elseif capturedContext[1].rodinSpiralFullSpeed ~= false then
-            if capturedContext[2].spiralRunAt ~= nil then
-                if value2 - capturedContext[2].spiralRunAt < 0.3 then
-                    value[11] = movement
-                    value[12] = value2 + capturedContext[1].boostRelease
-                    value[11].threatUntil = value[12]
-                end
-            end
-        end
-        argument = if value2 >= (movement.threatUntil or 0) then false else argument
-        argument = if capturedContext[2].speedOff
-            then false
-            else if context.lagBackOn then if context.lagBackOn() then false else argument else argument
-        argument = if context.buffHoldsSpeed(value2) then false else argument
-        value5 = capturedContext[2].reflex ~= nil and capturedContext[2].reflex.name == "slam"
-        argument = if (movement.foreignUntil or 0) > value2
-            then if value5
-                then argument
-                else if capturedContext[3].orbLead ~= nil
-                    then if context.unbuffedOk(value2) then argument else false
-                    else false
-            else argument
-        if context.BB ~= nil then
-            buffSpeedStamp = context.BB.lethal == true
-        end
-        lastRest = math.clamp(value2 - (movement.debtAt or value2), 0, 0.5)
-        movement.debtAt = value2
-        value5 = capturedContext[2].walkSpeedBefore
-            or capturedContext[2].walkSpeed
-            or capturedContext[1].tweenWalk
-        if movementBoost.boosted() then
-            movement.debt = (movement.debt or 0)
-                + math.max((movementBoost.speed() or value5) - value5, 0) * lastRest
-        else
-            value[13] = movement
-            value[14] = (math.max((movement.debt or 0) - (capturedContext[1].boostDrain or 8) * lastRest, 0))
-            value[13].debt = value[14]
-        end
-        value5 = capturedContext[1].boostLethalFree ~= false
-            and (
-                context.BB ~= nil and context.BB.lethal == true
-                or capturedContext[3].orbNear ~= nil and (capturedContext[3].orbNear.d or 999) < (capturedContext[1].orbBurstAt or 25)
-                or capturedContext[2].finishRushAt ~= nil and value2 - capturedContext[2].finishRushAt < 0.3
-                or capturedContext[2].tellRunAt ~= nil and value2 - capturedContext[2].tellRunAt < 0.3
-                or capturedContext[2].meleeEscapeAt ~= nil
-                    and value2 - capturedContext[2].meleeEscapeAt < 0.3
-                    and (capturedContext[2].meleeNearD or 99) < (capturedContext[1].meleeBurstAt or 20)
-            )
-        value5 = value5
-            or (
-                if capturedContext[1].rodinSpiralFullSpeed ~= false
-                    then if capturedContext[2].spiralRunAt ~= nil
-                        then if value2 - capturedContext[2].spiralRunAt < 0.3 then true else value5
-                        else value5
-                    else value5
-            )
-        value5 = value5
-            or (
-                if capturedContext[1].leadBurstFree ~= false
-                    then if capturedContext[3].orbLead ~= nil
-                        then if context.unbuffedOk(value2) then true else value5
-                        else value5
-                    else value5
-            )
-        value5 = value5
-            or (
-                if capturedContext[1].bobAggroBurstFree ~= false
-                    then if capturedContext[2].bobAggroAt ~= nil
-                        then if value2 - capturedContext[2].bobAggroAt
-                                < 0.3 + (capturedContext[1].boostRelease or 0.45)
-                            then if context.unbuffedOk(value2) then true else value5
-                            else value5
-                        else value5
-                    else value5
-            )
-        if
-            argument
-            and movement.boostSince
-            and not value5
-            and (
-                value2 - movement.boostSince > capturedContext[1].boostMaxRun
-                or (movement.debt or 0) >= (capturedContext[1].boostDebtMax or 12)
-            )
-        then
-            lastRest = (
-                math.max(
-                    capturedContext[1].boostRestMin or 0.4,
-                    ((movement.debt or 0) - (capturedContext[1].boostDebtStart or 3))
-                        / (capturedContext[1].boostDrain or 8)
-                )
-            )
-            movement.restUntil = value2 + lastRest
-            movement.lastRest = lastRest
-            argument = false
-        end
-        argument = argument
-            and (
-                if movement.boostSince
-                    then argument
-                    else if value5
-                        then argument
-                        else if (movement.debt or 0) > (capturedContext[1].boostDebtStart or 3)
-                            then false
-                            else argument
-            )
-        if if (movement.restUntil or 0) > value2 then if value5 then argument else false else argument then
-            if not capturedContext[2].walkSpeedBefore then
-                value[15] = capturedContext[2]
-                value[16] = context.walkNormal and context.walkNormal(humanoid)
-                    or math.min(humanoid.WalkSpeed, capturedContext[1].tweenWalk or 16)
-                value[15].walkSpeedBefore = value[16]
-                movement.boostSince = value2
-                movement.counts.boost = movement.counts.boost + 1
-            end
-            if lastSpeed >= (movement.lastSpeed or 0) - 0.01 then
-                movement.lastRaiseAt = value2
-            end
-            movement.lastSpeed = lastSpeed
-            movement.ourWalkSpeed = movementBoost.on(lastSpeed) or movementBoost.CONFIG.TargetSpeed
-            return
-        end
-        if movement.boostSince then
-            if movement.lastSpeed then
-                if value2 - (movement.lastRaiseAt or 0) < (capturedContext[1].wsDownHold or 0.6) then
-                    movement.ourWalkSpeed = movementBoost.on(movement.lastSpeed)
-                        or movementBoost.CONFIG.TargetSpeed
-                    return
-                end
-            end
-        end
-        movementBoost.off()
-        if capturedContext[2].walkSpeedBefore then
-            if not (context.buffHoldsSpeed(value2)) then
-                pcall(function()
-                    local value6 = {}
-                    value6[1] = humanoid
-                    value6[2] = capturedContext[2].walkSpeedBefore
-                    value6[1].WalkSpeed = value6[2]
-                end)
-                value[17] = movement
-                value[18] = capturedContext[2].walkSpeedBefore
-                value[17].ourWalkSpeed = value[18]
-                value[19] = capturedContext[2]
-                value[19].walkSpeedBefore = nil
-            end
-        end
-        movement.boostSince = nil
-    end
-    context.burstAvailable = function(argument)
-        if capturedContext[2].speedOff then
-            return false
-        elseif context.lagBackOn then
-            if context.lagBackOn() then
-                return false
-            end
-        end
-        if not (context.unbuffedOk(argument)) then
-            return context.buffHoldsSpeed(argument)
-        end
-        if (movement.foreignUntil or 0) > argument then
-            return false
-        end
-        if capturedContext[1].rodinSpiralFullSpeed ~= false then
-            if capturedContext[2].spiralRunAt ~= nil then
-                if os.clock() - capturedContext[2].spiralRunAt < 0.3 then
-                    return true
-                end
-            end
-        end
-        if capturedContext[1].boostLethalFree ~= false then
-            if
-                context.BB ~= nil and context.BB.lethal == true
-                or capturedContext[3].orbNear ~= nil and (capturedContext[3].orbNear.d or 999) < (capturedContext[1].orbBurstAt or 25)
-                or capturedContext[2].finishRushAt ~= nil and argument - capturedContext[2].finishRushAt < 0.3
-                or capturedContext[2].tellRunAt ~= nil and argument - capturedContext[2].tellRunAt < 0.3
-            then
-                return true
-            elseif capturedContext[2].meleeEscapeAt ~= nil then
-                if argument - capturedContext[2].meleeEscapeAt < 0.3 then
-                    if (capturedContext[2].meleeNearD or 99) < (capturedContext[1].meleeBurstAt or 20) then
-                        return true
-                    end
-                end
-            end
-        end
-        if (movement.restUntil or 0) > argument then
-            return false
-        end
-        if movement.boostSince then
-            if argument - movement.boostSince > capturedContext[1].boostMaxRun then
-                return false
-            elseif (movement.debt or 0) >= (capturedContext[1].boostDebtMax or 12) then
-                return false
-            end
-            return true
-        end
-        return (movement.debt or 0) <= (capturedContext[1].boostDebtStart or 3)
-    end
-    context.planSpeed = function(argument)
-        local value = capturedContext[2].walkSpeed or capturedContext[1].tweenWalk
-        if capturedContext[2].speedOff then
-            return value
-        elseif context.lagBackOn then
-            if context.lagBackOn() then
-                if not (context.buffHoldsSpeed(argument)) then
-                    return value
-                end
-            end
-        end
-        if not (context.unbuffedOk(argument)) then
-            return context.buffHoldsSpeed(argument) and (capturedContext[1].buffSpeed or 28) or value
-        end
-        if (movement.foreignUntil or 0) > argument + (capturedContext[1].planAtWalkOver or 0.5) then
-            return value
-        end
-        if (movement.restUntil or 0) > argument + (capturedContext[1].planAtWalkOver or 0.5) then
-            return value
-        end
-        argument = context.BB and context.BB.primary
-        if argument then
-            if argument.box then
-                if argument.box.name == "firstbossjumpslam" then
-                    return capturedContext[1].slamBurstMax or capturedContext[1].tweenEscape
-                end
-            end
-        end
-        if argument then
-            if argument.box then
-                if context.burstBox(argument.box.name) then
-                    return capturedContext[1].mageBurstMax or capturedContext[1].tweenEscape
-                end
-            end
-        end
-        return capturedContext[1].tweenEscape
+    context.burstAvailable = function(_now) return false end
+    context.planSpeed = function(_now)
+        return context.speedApply()
     end
     context.mageArcSteer = function(vector, argument, argument2)
         local value = {}
@@ -53259,6 +53067,8 @@ components.movementCombat = function(context)
         return nil
     end
     local function helper2(humanoid, progAt, argument, argument2, argument3, argument4)
+        local gameSpeed = context.speedApply(humanoid)
+        argument2 = math.min(tonumber(argument2) or gameSpeed, gameSpeed)
         local value = {}
         if
             HLGS == true
@@ -75874,30 +75684,9 @@ components.movementCombat = function(context)
         end
         return value142
     end
-    context.applyBurst = function(argument)
-        local value = {}
-        argument = tonumber(argument) or capturedContext[1].burstMax or 28
-        argument = if argument < 18 then 18 else argument
-        value[1] = capturedContext[1]
-        value[1].burstMax = argument
-        value[2] = capturedContext[1]
-        value[2].mageBurstMax = argument
-        value[3] = capturedContext[1]
-        value[3].slamBurstMax = argument
-        value[4] = capturedContext[1]
-        value[4].finishRushSpeed = argument
-        value[5] = capturedContext[1]
-        value[6] = capturedContext[1]
-        value[7] = (math.max(argument - 2, 16))
-        value[8] = (math.max(argument - 2, 16))
-        value[5].tweenEscape = value[7]
-        value[6].homeBurst = value[8]
-        if capturedContext[1].tweenSprint then
-            value[9] = capturedContext[1]
-            value[9].tweenSprint = argument
-        end
-        context.RT.lcCapSet = nil
-        context.RT.burstApplied = argument
+
+    context.applyBurst = function(_requestedSpeed)
+        return context.speedApply()
     end
     context.buffHoldsSpeed = function(argument)
         if capturedContext[1].buffFreezesWalkSpeed == false then
@@ -109904,7 +109693,7 @@ components.movementCombat = function(context)
                                                     value15[2] = capturedContext[1].slamBurstMax
                                                         or capturedContext[1].burstMax
                                                         or 28
-                                                    value15[1].WalkSpeed = value15[2]
+                                                    context.speedApply(value15[1])
                                                 end)
                                                 value2[592] = movement
                                                 value2[593] = capturedContext[1].slamBurstMax
@@ -110299,7 +110088,7 @@ components.movementCombat = function(context)
                                         if not (context.buffHoldsSpeed(argument)) then
                                             if context.unbuffedOk(argument) then
                                                 pcall(function()
-                                                    humanoid.WalkSpeed = value1023
+                                                    context.speedApply(humanoid)
                                                 end)
                                                 movement.ourWalkSpeed = value1023
                                             end
@@ -110626,7 +110415,7 @@ components.movementCombat = function(context)
                                         local value15 = {}
                                         value15[1] = humanoid
                                         value15[2] = capturedContext[1].finishRushSpeed or 28
-                                        value15[1].WalkSpeed = value15[2]
+                                        context.speedApply(value15[1])
                                     end)
                                     value2[614] = movement
                                     value2[615] = capturedContext[1].finishRushSpeed or 28
@@ -112085,7 +111874,7 @@ components.movementCombat = function(context)
                     if not (context.buffHoldsSpeed(argument)) then
                         if context.unbuffedOk(argument) then
                             pcall(function()
-                                humanoid.WalkSpeed = value1187
+                                context.speedApply(humanoid)
                             end)
                             movement.ourWalkSpeed = value1187
                         end
@@ -112213,7 +112002,7 @@ components.movementCombat = function(context)
                     if not (context.buffHoldsSpeed(argument)) then
                         if context.unbuffedOk(argument) then
                             pcall(function()
-                                humanoid.WalkSpeed = value1198
+                                context.speedApply(humanoid)
                             end)
                             movement.ourWalkSpeed = value1198
                         end
@@ -116743,6 +116532,20 @@ components.movementCombat = function(context)
                 helper(argument, false)
             end
         end
+    -- Pure normal-speed steering for the non-boss reflex planner. It reuses
+    -- this controller's input ownership instead of starting another move loop.
+    context.mobReflexDrive = function(humanoid,root,goal,now)
+        local flat=Vector3.new(goal.X-root.Position.X,0,goal.Z-root.Position.Z)
+        if flat.Magnitude<0.1 then return end
+        local direction=flat.Unit
+        setControlsEnabled(false)
+        movement.driving=true; movement.cmdDir=direction; movement.cmdAt=now
+        movement.stallSince=nil; movement.lastPos=root.Position
+        combatBrain.waypoints=nil; combatBrain.goTo=goal; combatBrain.goToAt=now
+        movementBoost.steer(direction)
+        humanoid:Move(direction,false)
+    end
+
 end
 
 components.inventoryAutomation = function(context)
@@ -143414,43 +143217,17 @@ components.interfaceMainLoop = function(context)
         helper12()
         sharedValue4.lastApply = -math.huge
     end
+
     do
-        local function helper14(argument)
-            runtimeState.speedOff = not argument
-            context.log(
-                "Speed",
-                argument and ("escape speed ON, %.0f (fixed)"):format(config.tweenEscape)
-                    or "escape speed OFF (walking pace)"
-            )
+        local function reportGameSpeed()
+            context.log("Speed", ("Current %.1f | %s")
+                :format(context.gameSpeedNow(), context.harvardSpeed21Status()))
         end
-        sliderConnections[#sliderConnections + 1] = userInputService.InputBegan:Connect(
-            function(input, argument)
-                if argument then
-                    return
-                end
-                if input.KeyCode == Enum.KeyCode.F9 then
-                    helper14(runtimeState.speedOff == true)
-                end
-            end
-        )
-        sliderConnections[#sliderConnections + 1] = localPlayer.Chatted:Connect(function(argument)
-            local value = tostring(argument):match("^/speed%s*(%S*)")
-            if not value then
-                return
-            end
-            argument = string.lower(value)
-            if argument == "" then
-                helper14(runtimeState.speedOff == true)
-            elseif argument == "on" then
-                helper14(true)
-            elseif argument == "off" then
-                helper14(false)
-            elseif tonumber(argument) then
-                context.log(
-                    "Speed",
-                    ("the escape speed is fixed at %.0f; nothing sets it"):format(config.tweenEscape)
-                )
-            end
+        sliderConnections[#sliderConnections + 1] = userInputService.InputBegan:Connect(function(input, processed)
+            if not processed and input.KeyCode == Enum.KeyCode.F9 then reportGameSpeed() end
+        end)
+        sliderConnections[#sliderConnections + 1] = localPlayer.Chatted:Connect(function(message)
+            if tostring(message):match("^/speed%s*(%S*)") then reportGameSpeed() end
         end)
     end
     local function destructScript()
@@ -146370,6 +146147,18 @@ components.interfaceMainLoop = function(context)
         end, function(enabled)
             context.harvardSetAutoExecute(enabled)
         end, 2, "Reload this saved script after dungeon/server teleports. Requires executor teleport-queue and file support."))
+        helper(uiLibrary.toggle(runsThisAccount, "Mob dodge assist", function()
+            return config.harvardMobDodge ~= false
+        end, function(enabled)
+            config.harvardMobDodge=enabled
+            saveConfig()
+        end, 6, "Extra escape planning for regular Gilded Skies mobs. Boss encounters keep the original controller."))
+        helper(uiLibrary.toggle(runsThisAccount, "Speed 21 (experimental)", function()
+            return config.harvardSpeed21 ~= false
+        end, function(enabled)
+            context.harvardSetSpeed21(enabled)
+            saveConfig()
+        end, 7, "Target 21 while farming, without a separate burst. Off returns to game speed. No verified anti-cheat-safe threshold. If the game changes speed, this setting yields until respawn."))
         local persistenceRow = uiLibrary.buttonRow(runsThisAccount, 3)
         persistenceRow.add("Save config now", "accent", function() context.harvardSaveNow() end,
             "Save this account's current settings immediately.")
@@ -162196,7 +161985,7 @@ components.interfaceMainLoop = function(context)
                     if value2 then
                         humanoid:MoveTo(value2.Position)
                     end
-                    humanoid.WalkSpeed = config.tweenWalk or 16
+                    context.speedApply(humanoid)
                 end)
             end
         end
@@ -162324,7 +162113,7 @@ components.interfaceMainLoop = function(context)
             end
             value = tonumber(config.candySpeed) or 28
             if humanoid.WalkSpeed ~= value then
-                humanoid.WalkSpeed = value
+                context.speedApply(humanoid)
             end
             local position, moveTarget, path = value2.Position, candy.goal, candy.path
             if path then
@@ -164464,6 +164253,18 @@ components.interfaceMainLoop = function(context)
     local helper234
     local function helper235(argument)
         if runtimeState.farmEnabled then
+            local mobOwnsMovement = false
+            if context.mobReflexTick then
+                local ok, owned = pcall(context.mobReflexTick, argument)
+                if ok then mobOwnsMovement = owned == true
+                else
+                    runtimeState.mobDodgeUntil = nil
+                    if context.mobDodge then context.mobDodge.active = false end
+                    runtimeState.lastError = "Mob dodge: " .. tostring(owned)
+                    runtimeState.lastErrorAt = argument
+                end
+            end
+            if not mobOwnsMovement then
             context.brainTick(argument)
             if context.redPushApply then
                 context.redPushApply(argument)
@@ -164479,6 +164280,7 @@ components.interfaceMainLoop = function(context)
             end
             if context.orbPushApply then
                 context.orbPushApply(argument)
+            end
             end
         else
             helper2()
@@ -165036,18 +164838,21 @@ local ok, reason = xpcall(function()
     for index, name in ipairs(order) do
         if stopped then return end
         currentStage = name
-        print(("[DQR Harvard V12] Loading %d/18: %s"):format(index, name))
+        print(("[DQR Harvard V15] Loading %d/18: %s"):format(index, name))
         components[name](context)
+        if name == "movementCombat" then installMobReflex(context) end
         if name == "coreSettings" then
             installHarvardAutoStart(context)
             installHarvardPersistence(context)
+            context.CFG.harvardSpeed21 = true
+            table.insert(context.PERSIST, "harvardSpeed21")
             context.loadConfig()
             if context.CFG.harvardFarmOnLaunch == false then context.RT.farmEnabled = false end
         end
         task.wait()
     end
     if stopped then return end
-    context.INTEGRATION_VERSION = "V12 Harvard save/auto-execute"
+    context.INTEGRATION_VERSION = "V15 Harvard speed 21"
     context.harvardPersistence.refresh()
     pcall(context.saveConfig)
     local dungeon = context.Workspace:FindFirstChild("dungeonName")
@@ -165061,10 +164866,10 @@ local ok, reason = xpcall(function()
     if context.notify then
         context.notify("run", "Harvard ready", "Auto-start dungeon: " .. (context.CFG.autoStartDungeon ~= false and "ON" or "OFF") .. ". All controls are in this menu.")
     end
-    print("[DQR Harvard V12] Ready: Harvard menu only; auto-start " .. tostring(context.CFG.autoStartDungeon ~= false))
+    print("[DQR Harvard V15] Ready: Harvard menu only; auto-start " .. tostring(context.CFG.autoStartDungeon ~= false))
 end, function(err) return debug.traceback(tostring(err), 2) end)
 if not ok then
-    warn("[DQR Harvard V12] " .. currentStage .. ": " .. tostring(reason))
+    warn("[DQR Harvard V15] " .. currentStage .. ": " .. tostring(reason))
     stopHarvardEngine()
     pcall(function()
         getService("StarterGui"):SetCore("SendNotification", {
@@ -165087,8 +164892,8 @@ local cached, cacheError = pcall(function()
     assert(readfile(cachePath)==payload, "saved engine verification failed")
 end)
 env.DQRHarvardCacheReady = cached
-if not cached then warn("[DQR Harvard V12] Auto-execute cache unavailable: "..tostring(cacheError)) end
+if not cached then warn("[DQR Harvard V15] Auto-execute cache unavailable: "..tostring(cacheError)) end
 assert(type(loadstring)=="function", "Executor loadstring is required to run the bundled engine")
-local run, compileError = loadstring(payload,"@DQR_Harvard_V12")
+local run, compileError = loadstring(payload,"@DQR_Harvard_V15")
 assert(run,tostring(compileError))
 return run()
