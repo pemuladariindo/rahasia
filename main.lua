@@ -1,22 +1,34 @@
 --[[
-DQR GILDED V11 - HARVARD MENU ONLY / AUTO START
-For Bisri / ichi. Complete user-provided Harvard Labs v3.0 c84b engine.
-All 18 reference components are retained. The extra V10 compact menu is removed.
+DQR GILDED V12 - HARVARD / SAVE CONFIG / AUTO-EXECUTE
+Run this complete file once. It saves its bundled engine in the executor's local
+workspace and runs it. No HTTP downloads or external code are used.
 
-Run the complete file. The Harvard menu opens and farming is enabled in a
-dungeon automatically. Auto start dungeon is ON after migrating V10 settings.
-Toggle it under Harvard > Autofarm > Auto start dungeon; your choice is saved.
-START dispatch respects the reference's party, loadout, countdown and retry guards.
-On executors without signal access, mouse input is attempted as a fallback.
-Disable Enable Autofarm in the same menu to pause combat; use its close/remove
-action to unload the engine. Existing reference queue/party settings are retained.
-Queueing from the lobby and rerunning after a teleport still need the reference's
-party configuration and an executor that reloads this file after teleports.
+Harvard > Autofarm:
+- Save config now / Load saved config
+- Auto-execute after teleport (ON by default)
+- Copy AutoExec loader (optional: add to the executor's startup AutoExec feature)
 
-Settings stay under DQR_GildedV10/ to preserve the preceding version's settings.
-Webhooks default OFF. Optional external waypoint/asset files were not provided.
-Compiled and tested locally with mocks; actual game/executor testing is still needed.
-Original Harvard Labs and deobfuscation credits remain below.
+Settings are per Roblox account. Existing V10/V11 settings are preserved.
+Automatic settings saves remain every 10 seconds and before teleports.
+Teleport auto-execute requires queue_on_teleport (or a supported equivalent),
+writefile, readfile, isfile, and loadstring. The menu shows whether it is ready.
+Restarting the Roblox app still needs executor startup AutoExec/reinjection.
+The script cannot keep Roblox running after the app closes or the device sleeps.
+Only the Harvard menu is used; all 18 supplied reference components are embedded.
+Compiled and tested locally with mocks; not tested in an actual dungeon.
+]]
+local cachePath = "DQR_GildedV10/runtime/harvard_v12_engine.lua"
+local env = type(getgenv) == "function" and getgenv() or _G
+
+local payload = [=====[
+-- DQR_HARVARD_RUNTIME_V12
+--[[
+DQR HARVARD V12 RUNTIME
+All 18 user-supplied reference components; Harvard menu only.
+Per-account save/load, autosave and teleport auto-execute are available in Autofarm.
+This local cached engine is installed by DQR_Gilded_V12_AutoExec.lua.
+Run the complete installer again after moving or deleting this cached file.
+Original reference/deobfuscation credits are preserved below.
 ]]
 
 --[[
@@ -142,10 +154,200 @@ end
 -- Remove an earlier V9/V10/V11 copy before loading the single Harvard menu.
 do
     local seen = {}
-    for _, cleanup in pairs({ _G.DQRGildedV11Cleanup, _G.DQRGildedV10Cleanup, _G.GS9Cleanup, _G.DungeonAutofarmDestruct }) do
+    for _, cleanup in pairs({ _G.DQRGildedV12Cleanup, _G.DQRGildedV10Cleanup, _G.GS9Cleanup, _G.DungeonAutofarmDestruct }) do
         if type(cleanup) == "function" and not seen[cleanup] then seen[cleanup]=true; pcall(cleanup) end
     end
 end
+local HARVARD_RESUME_LOADER = [====[
+-- DQR Harvard V12: cached local engine loader; no HTTP or downloaded code.
+local env = type(getgenv) == "function" and getgenv() or _G
+if not game:IsLoaded() then game.Loaded:Wait() end
+local job = tostring(game.JobId)
+local active = _G.DQRGildedV12Context
+if active and active.HARVARD_JOB == job and active.RT and not active.RT.destroyed then return end
+if env.DQRHarvardResumeLock == job then return end
+env.DQRHarvardResumeLock = job
+local ok, result = pcall(function()
+    assert(type(readfile) == "function", "Executor readfile is unavailable")
+    local players = game:GetService("Players")
+    local localPlayer = players.LocalPlayer
+    local deadline = os.clock() + 15
+    while not localPlayer and os.clock() < deadline do
+        task.wait(0.1)
+        localPlayer = players.LocalPlayer
+    end
+    assert(localPlayer, "LocalPlayer is not ready; run the complete V12 file again")
+    local user = tostring(localPlayer.UserId)
+    local configPath = "DQR_GildedV10/configs/release_" .. user .. ".json"
+    local hasConfig, configText = pcall(readfile, configPath)
+    if hasConfig then
+        local decoded, cfg = pcall(function()
+            return game:GetService("HttpService"):JSONDecode(configText)
+        end)
+        if decoded and type(cfg) == "table" and cfg.harvardAutoExecute == false then return end
+    end
+    local source = readfile("DQR_GildedV10/runtime/harvard_v12_engine.lua")
+    assert(type(source) == "string" and source:find("-- DQR_HARVARD_RUNTIME_V12", 1, true) == 1,
+        "Cached V12 engine is missing or outdated; run the complete V12 file once")
+    assert(type(loadstring) == "function", "Executor loadstring is unavailable")
+    local run, compileError = loadstring(source, "@DQR_Harvard_V12")
+    assert(run, tostring(compileError))
+    return run()
+end)
+env.DQRHarvardResumeLock = nil
+if not ok then warn("[DQR Harvard V12 AutoExec] " .. tostring(result)) end
+return result
+]====]
+local function installHarvardPersistence(context)
+    local cfg, rt = context.CFG, context.RT
+    local env = type(getgenv) == "function" and getgenv() or _G
+    local state = {pending = false, stopped = false, status = "Checking auto-execute", saveState = "Ready"}
+    context.harvardPersistence = state
+    context.PERSIST = context.PERSIST or {}
+    for _, key in ipairs({ "harvardAutoExecute", "harvardFarmOnLaunch" }) do
+        local found = false
+        for _, saved in ipairs(context.PERSIST) do if saved == key then found = true end end
+        if not found then table.insert(context.PERSIST, key) end
+        if cfg[key] == nil then cfg[key] = true end
+    end
+
+    local function queueFunction()
+        for _, candidate in pairs({
+            queue_on_teleport, queueonteleport,
+            type(syn) == "table" and syn.queue_on_teleport or false,
+            type(fluxus) == "table" and fluxus.queue_on_teleport or false,
+            env.queue_on_teleport, env.queueonteleport,
+        }) do
+            if type(candidate) == "function" then return candidate end
+        end
+    end
+    local function filesAvailable()
+        return type(writefile) == "function" and type(readfile) == "function" and type(isfile) == "function"
+    end
+    local function sourceAvailable(force)
+        if env.DQRHarvardCacheReady == false then return false end
+        if not force and state.sourceVerified then return true end
+        if type(readfile) ~= "function" then return false end
+        local ok, source = pcall(readfile, "DQR_GildedV10/runtime/harvard_v12_engine.lua")
+        state.sourceVerified = ok and type(source) == "string" and source:find("-- DQR_HARVARD_RUNTIME_V12", 1, true) == 1
+        return state.sourceVerified
+    end
+    local function notify(title, message)
+        if context.notify then pcall(context.notify, "info", title, message) end
+        if context.log then pcall(context.log, "Config/AutoExec", message) end
+    end
+    local rawSave = context.saveConfig
+    context.saveConfig = function(...)
+        local result = table.pack(rawSave(...))
+        if result[1] == true then
+            state.saveState = "Saved"
+            state.lastSaveAt = os.time()
+        elseif not filesAvailable() then
+            state.saveState = "File APIs unavailable"
+        elseif rt.configAsk then
+            state.saveState = "Finish profile selection first"
+        else
+            state.saveState = "Save failed"
+        end
+        return table.unpack(result, 1, result.n)
+    end
+
+    function state.refresh()
+        if cfg.harvardAutoExecute == false then state.status = "OFF"
+        elseif state.stopped or rt.destroyed then state.status = "Stopped"
+        elseif not queueFunction() then state.status = "Executor has no teleport queue"
+        elseif not filesAvailable() then state.status = "Executor file APIs unavailable"
+        elseif not sourceAvailable() then state.status = "Run the complete V12 file once"
+        elseif state.queueError then state.status = "Queue failed: " .. state.queueError
+        elseif state.pending then state.status = "Queued for the next server"
+        else state.status = "Ready for teleport" end
+        if state.caption and state.caption.Parent then
+            state.caption.Text = "Auto-save: " .. tostring(tonumber(cfg.autosaveInterval) or 10)
+                .. "s | " .. state.saveState .. "\nAuto-execute: " .. state.status
+        end
+        return state.status
+    end
+
+    function context.harvardSaveNow()
+        local ok, saved = pcall(context.saveConfig)
+        if not ok then state.saveState = "Save error: " .. tostring(saved):sub(1,80) end
+        state.refresh()
+        notify("Save config", ok and saved == true and "Config saved for this account." or state.saveState)
+        return ok and saved == true
+    end
+    function context.harvardLoadNow()
+        local ok, loaded = pcall(context.loadConfig)
+        if ok and loaded ~= false then
+            if context.refreshAllWidgets then pcall(context.refreshAllWidgets) end
+            if cfg.harvardFarmOnLaunch == false then
+                rt.farmEnabled = false
+                if context.character and context.releaseMover then
+                    local _, hum, root = context.character()
+                    pcall(context.releaseMover, hum, root)
+                end
+            end
+            notify("Load config", "Saved settings loaded.")
+        else notify("Load config", "Could not load saved config: " .. tostring(loaded)) end
+        state.refresh()
+        return ok and loaded ~= false
+    end
+    function context.harvardSetAutoExecute(enabled)
+        cfg.harvardAutoExecute = enabled == true
+        context.harvardSaveNow()
+        state.refresh()
+    end
+    function context.harvardCopyAutoExec()
+        local copy = setclipboard or toclipboard
+        if type(copy) ~= "function" then notify("AutoExec loader", "Clipboard is unavailable in this executor."); return false end
+        local ok, reason = pcall(copy, HARVARD_RESUME_LOADER)
+        notify("AutoExec loader", ok and "Loader copied. Add it to the executor's AutoExec feature for future launches." or tostring(reason))
+        return ok
+    end
+    function state.queue()
+        if state.stopped or rt.destroyed or cfg.harvardAutoExecute == false or state.pending then return false end
+        local queue = queueFunction()
+        if not queue or not filesAvailable() or not sourceAvailable(true) then
+            state.refresh()
+            notify("Auto-execute unavailable", state.status)
+            return false
+        end
+        context.harvardSaveNow()
+        local ok, reason = pcall(queue, HARVARD_RESUME_LOADER)
+        if not ok then
+            state.queueError = tostring(reason):sub(1,100)
+            state.status = "Queue failed: " .. state.queueError
+            notify("Auto-execute", state.status)
+            return false
+        end
+        state.pending = true
+        state.queueError = nil
+        state.refresh()
+        return true
+    end
+    function state.stop()
+        if state.stopped then return end
+        state.stopped = true
+        if state.teleportConnection then state.teleportConnection:Disconnect() end
+        if state.statusConnection then state.statusConnection:Disconnect() end
+    end
+    state.teleportConnection = context.LocalPlayer.OnTeleport:Connect(function(teleportState)
+        if teleportState == Enum.TeleportState.Started or teleportState == Enum.TeleportState.RequestedFromServer then
+            state.queue()
+        elseif tostring(teleportState):find("Failed", 1, true) then
+            state.pending = false
+            state.refresh()
+        end
+    end)
+    table.insert(context.sliderConnections, state.teleportConnection)
+    local lastStatus = -math.huge
+    state.statusConnection = context.RunService.Heartbeat:Connect(function()
+        if state.stopped or rt.destroyed then return end
+        local now = os.clock()
+        if now - lastStatus >= 2 then lastStatus = now; state.refresh() end
+    end)
+    table.insert(context.sliderConnections, state.statusConnection)
+end
+
 local components = {}
 
 
@@ -119157,8 +119359,9 @@ components.partyQueue = function(context)
             and (farmEnabled or sharedValue.place == "Lobby")
         then
             sharedValue.farmAppliedFor = sharedValue.place
-            if runtimeState.farmEnabled ~= farmEnabled then
-                runtimeState.farmEnabled = farmEnabled
+            local desiredFarm = farmEnabled and config.harvardFarmOnLaunch ~= false
+            if runtimeState.farmEnabled ~= desiredFarm then
+                runtimeState.farmEnabled = desiredFarm
                 if context.setLoopButtonState then
                     pcall(context.setLoopButtonState)
                 end
@@ -143255,6 +143458,7 @@ components.interfaceMainLoop = function(context)
             return
         end
         runtimeState.destroyed = true
+        if context.harvardPersistence then context.harvardPersistence.stop() end
         if context._bootstrapTeleport then
             pcall(function() context._bootstrapTeleport:Disconnect() end)
             context._bootstrapTeleport = nil
@@ -146135,6 +146339,8 @@ components.interfaceMainLoop = function(context)
             return runtimeState.farmEnabled
         end, function(farmEnabled)
             runtimeState.farmEnabled = farmEnabled
+            config.harvardFarmOnLaunch = farmEnabled
+            saveConfig()
             if not farmEnabled then
                 helper2()
             end
@@ -146158,6 +146364,24 @@ components.interfaceMainLoop = function(context)
             1,
             "Press START automatically after the dungeon is ready. Gilded Skies still waits for the party and loadout."
         ))
+
+        helper(uiLibrary.toggle(runsThisAccount, "Auto-execute after teleport", function()
+            return config.harvardAutoExecute ~= false
+        end, function(enabled)
+            context.harvardSetAutoExecute(enabled)
+        end, 2, "Reload this saved script after dungeon/server teleports. Requires executor teleport-queue and file support."))
+        local persistenceRow = uiLibrary.buttonRow(runsThisAccount, 3)
+        persistenceRow.add("Save config now", "accent", function() context.harvardSaveNow() end,
+            "Save this account's current settings immediately.")
+        persistenceRow.add("Load saved config", "secondary", function() context.harvardLoadNow() end,
+            "Restore the settings saved for this account.")
+        local autoExecRow = uiLibrary.buttonRow(runsThisAccount, 4)
+        autoExecRow.add("Copy AutoExec loader", "secondary", function() context.harvardCopyAutoExec() end,
+            "Copy a small loader for the executor's AutoExec feature. Run this complete file once before using it.")
+        context.harvardPersistence.caption = uiLibrary.label(runsThisAccount, "Checking save/auto-execute...", "captionSub", 5)
+        context.harvardPersistence.caption.Size = UDim2.new(1,0,0,38)
+        context.harvardPersistence.caption.TextWrapped = true
+        context.harvardPersistence.refresh()
 
         helper15(
             runsThisAccount,
@@ -164777,6 +165001,7 @@ local function stopHarvardEngine()
     if context.RT then context.RT.farmEnabled = false end
     if context.destructScript then pcall(context.destructScript) end
     if context.RT then context.RT.destroyed = true end
+    if context.harvardPersistence then context.harvardPersistence.stop() end
     for _, method in ipairs({ "readerStop", "clearDrawing" }) do
         if context[method] then pcall(context[method]) end
     end
@@ -164794,11 +165019,11 @@ local function stopHarvardEngine()
             if gui then pcall(function() gui:Destroy() end) end
         end
     end
-    if _G.DQRGildedV11Context == context then _G.DQRGildedV11Context = nil end
-    if _G.DQRGildedV11Cleanup == stopHarvardEngine then _G.DQRGildedV11Cleanup = nil end
+    if _G.DQRGildedV12Context == context then _G.DQRGildedV12Context = nil end
+    if _G.DQRGildedV12Cleanup == stopHarvardEngine then _G.DQRGildedV12Cleanup = nil end
     if _G.GS9Cleanup == stopHarvardEngine then _G.GS9Cleanup = nil end
 end
-_G.DQRGildedV11Cleanup = stopHarvardEngine
+_G.DQRGildedV12Cleanup = stopHarvardEngine
 _G.GS9Cleanup = stopHarvardEngine
 local ok, reason = xpcall(function()
     local order = {
@@ -164811,30 +165036,35 @@ local ok, reason = xpcall(function()
     for index, name in ipairs(order) do
         if stopped then return end
         currentStage = name
-        print(("[DQR Harvard V11] Loading %d/18: %s"):format(index, name))
+        print(("[DQR Harvard V12] Loading %d/18: %s"):format(index, name))
         components[name](context)
         if name == "coreSettings" then
             installHarvardAutoStart(context)
+            installHarvardPersistence(context)
             context.loadConfig()
+            if context.CFG.harvardFarmOnLaunch == false then context.RT.farmEnabled = false end
         end
         task.wait()
     end
     if stopped then return end
-    context.INTEGRATION_VERSION = "V11 Harvard single menu"
+    context.INTEGRATION_VERSION = "V12 Harvard save/auto-execute"
+    context.harvardPersistence.refresh()
+    pcall(context.saveConfig)
     local dungeon = context.Workspace:FindFirstChild("dungeonName")
     local inDungeon = game.PlaceId == 101088859550383
         or dungeon and dungeon:IsA("StringValue") and dungeon.Value ~= ""
-    context.RT.farmEnabled = inDungeon == true
+    context.HARVARD_JOB = tostring(game.JobId)
+    context.RT.farmEnabled = inDungeon == true and context.CFG.harvardFarmOnLaunch ~= false
     if context.setLoopButtonState then pcall(context.setLoopButtonState) end
     if context.Shell and context.Shell.setShown then pcall(context.Shell.setShown, true) end
-    _G.DQRGildedV11Context = context
+    _G.DQRGildedV12Context = context
     if context.notify then
         context.notify("run", "Harvard ready", "Auto-start dungeon: " .. (context.CFG.autoStartDungeon ~= false and "ON" or "OFF") .. ". All controls are in this menu.")
     end
-    print("[DQR Harvard V11] Ready: Harvard menu only; auto-start " .. tostring(context.CFG.autoStartDungeon ~= false))
+    print("[DQR Harvard V12] Ready: Harvard menu only; auto-start " .. tostring(context.CFG.autoStartDungeon ~= false))
 end, function(err) return debug.traceback(tostring(err), 2) end)
 if not ok then
-    warn("[DQR Harvard V11] " .. currentStage .. ": " .. tostring(reason))
+    warn("[DQR Harvard V12] " .. currentStage .. ": " .. tostring(reason))
     stopHarvardEngine()
     pcall(function()
         getService("StarterGui"):SetCore("SendNotification", {
@@ -164844,3 +165074,21 @@ if not ok then
     end)
 end
 return context
+]=====]
+local cached, cacheError = pcall(function()
+    assert(type(writefile)=="function" and type(readfile)=="function", "executor file APIs unavailable")
+    if type(makefolder)=="function" then
+        for _,path in ipairs({"DQR_GildedV10","DQR_GildedV10/runtime"}) do
+            local exists = type(isfolder)=="function" and isfolder(path)
+            if not exists then pcall(makefolder,path) end
+        end
+    end
+    writefile(cachePath, payload)
+    assert(readfile(cachePath)==payload, "saved engine verification failed")
+end)
+env.DQRHarvardCacheReady = cached
+if not cached then warn("[DQR Harvard V12] Auto-execute cache unavailable: "..tostring(cacheError)) end
+assert(type(loadstring)=="function", "Executor loadstring is required to run the bundled engine")
+local run, compileError = loadstring(payload,"@DQR_Harvard_V12")
+assert(run,tostring(compileError))
+return run()
