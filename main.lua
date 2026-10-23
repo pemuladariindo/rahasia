@@ -1,26 +1,22 @@
 --[[
-DQR GILDED HUB V10 - COMPLETE REFERENCE INTEGRATION
-Built for Bisri / ichi from the two user-provided sources.
+DQR GILDED V11 - HARVARD MENU ONLY / AUTO START
+For Bisri / ichi. Complete user-provided Harvard Labs v3.0 c84b engine.
+All 18 reference components are retained. The extra V10 compact menu is removed.
 
-Keeps the V9.5 compact Farm / Combat / Sensors / Debug layout.
-All 18 components of the supplied v3.0 c84b reference are embedded below.
-Original reference credit: Harvard Labs; deobfuscation header preserved.
+Run the complete file. The Harvard menu opens and farming is enabled in a
+dungeon automatically. Auto start dungeon is ON after migrating V10 settings.
+Toggle it under Harvard > Autofarm > Auto start dungeon; your choice is saved.
+START dispatch respects the reference's party, loadout, countdown and retry guards.
+On executors without signal access, mouse input is attempted as a fallback.
+Disable Enable Autofarm in the same menu to pause combat; use its close/remove
+action to unload the engine. Existing reference queue/party settings are retained.
+Queueing from the lobby and rerunning after a teleport still need the reference's
+party configuration and an executor that reloads this file after teleports.
 
-USE
-1. Run this complete file as a client-side Luau script.
-2. Wait for READY, then press START AUTOFARM.
-3. ALL FEATURES / FULL SETTINGS opens the complete reference interface.
-4. STOP destroys the active engine; START loads a fresh engine.
-5. DEBUG shows startup/runtime errors. RELOAD ENGINE reloads without starting.
-
-The script starts paused. Webhooks start disabled and can be configured in
-Full Settings. Settings and optional local waypoint files use DQR_GildedV10/.
-Optional custom data/assets from the reference were not included in the upload.
-No remote code loader or downloaded dependency is added.
-
-Validation: compiled with the official Luau compiler; lifecycle/UI checks use
-local mocks. Actual dungeon behavior and executor APIs require in-game testing.
-This file includes the complete reference, so it is approximately 7 MiB.
+Settings stay under DQR_GildedV10/ to preserve the preceding version's settings.
+Webhooks default OFF. Optional external waypoint/asset files were not provided.
+Compiled and tested locally with mocks; actual game/executor testing is still needed.
+Original Harvard Labs and deobfuscation credits remain below.
 ]]
 
 --[[
@@ -31,12 +27,12 @@ This file includes the complete reference, so it is approximately 7 MiB.
 
 local players = game:GetService("Players")
 local player = players.LocalPlayer
-local playerDeadline = os.clock() + 15
-while not player and os.clock() < playerDeadline do
+local deadline = os.clock() + 15
+while not player and os.clock() < deadline do
     task.wait(0.1)
     player = players.LocalPlayer
 end
-assert(player, "Run this script in the Roblox client: LocalPlayer unavailable")
+assert(player, "LocalPlayer unavailable: run in the game client")
 
 local serviceCache = {}
 local function getService(name)
@@ -66,560 +62,90 @@ argumentHelpers.appendPackedValues = function(_helpers, destination, offset, val
 end
 
 
--- Lifecycle adapter for the complete, embedded reference engine.
-local function createIntegration(hooks)
-    local bridge = {
-        context = nil,
-        alive = true,
-        loading = false,
-        ready = false,
-        armed = false,
-        generation = 0,
-        desiredFlags = {},
-        history = {},
-        resumeAfterDeath = true,
-        source = "Harvard Labs v3.0 c84b / user supplied reference",
-    }
-    local startupFlags = { "autoFarmByPlace", "autoQueue", "autoQueueReplay", "autoStartDungeon" }
-
-    function bridge:log(message)
-        message = tostring(message)
-        table.insert(self.history, 1, message)
-        while #self.history > 30 do table.remove(self.history) end
-        print("[DQR V10] " .. message)
-        if hooks.log then pcall(hooks.log, message, self.history) end
+-- Start controls shared by the Harvard menu and its existing lobby controller.
+local function installHarvardAutoStart(context)
+    local cfg = context.CFG
+    local persist = context.PERSIST or {}
+    local found = false
+    for _, key in ipairs(persist) do if key == "harvardAutoStartV11" then found = true end end
+    if not found then table.insert(persist, "harvardAutoStartV11") end
+    context.PERSIST = persist
+    local originalLoad = context.loadConfig
+    context.loadConfig = function(...)
+        local result = table.pack(originalLoad(...))
+        -- Migrate V10's saved paused settings once; later user choices persist.
+        if cfg.harvardAutoStartV11 ~= true then
+            cfg.autoStartDungeon = true
+            cfg.autoFarmByPlace = true
+            cfg.harvardAutoStartV11 = true
+            if context.saveConfig then pcall(context.saveConfig) end
+        end
+        cfg.gsAutoStart = cfg.autoStartDungeon ~= false
+        cfg.gsRunButtons = false
+        return table.unpack(result, 1, result.n)
     end
 
-    function bridge:status(message)
-        self.statusText = tostring(message)
-        if hooks.status then pcall(hooks.status, self.statusText) end
-    end
-
-    function bridge:holdStartup(context)
-        if self.armed then return end
-        local cfg = context.CFG
-        if cfg then
-            for _, key in ipairs(startupFlags) do
-                if self.desiredFlags[key] == nil then self.desiredFlags[key] = cfg[key] end
-                cfg[key] = false
-            end
+    function context.pressDungeonStart(button)
+        if not button or not button.Parent or button.Visible == false then
+            return 0, "START button is unavailable"
         end
-        if context.RT then context.RT.farmEnabled = false end
-    end
-
-    function bridge:release(context)
-        if not context then return end
-        if hooks.releaseInput then pcall(hooks.releaseInput) end
-        if context.RT then context.RT.farmEnabled = false end
-        -- Set destroyed AFTER the original destructor: it uses that field as its guard.
-        if type(context.destructScript) == "function" then
-            local ok, err = pcall(context.destructScript)
-            if not ok then self:log("Cleanup: " .. tostring(err)) end
-        end
-        if context.RT then context.RT.destroyed = true end
-        local function call(fn, ...)
-            if type(fn) == "function" then pcall(fn, ...) end
-        end
-        -- Also works if loading failed before the reference destructor was installed.
-        local _, hum, root
-        if context.character then
-            local ok, char, h, r = pcall(context.character)
-            if ok then hum, root = h, r end
-        end
-        call(context.releaseMover, hum, root)
-        call(context.restoreWalkSpeed, hum)
-        call(context.readerStop)
-        call(context.clearDrawing)
-        call(context.LC and context.LC.stop)
-        call(context.BB and context.BB.stop)
-        call(context.faceRelease, root)
-        local walls = context.WALLS
-        call(walls and (walls.detach or walls.stop))
-        if hum and root then pcall(function() hum:MoveTo(root.Position) end) end
-        for _, conn in ipairs(context.sliderConnections or {}) do
-            pcall(function() conn:Disconnect() end)
-        end
-        if context._bootstrapTeleport then
-            pcall(function() context._bootstrapTeleport:Disconnect() end)
-            context._bootstrapTeleport = nil
-        end
-        if context.RT then
-            for _, key in ipairs({ "hudConnection", "mainConnection", "streamerConnection" }) do
-                local conn = context.RT[key]
-                if conn then pcall(function() conn:Disconnect() end) end
-                context.RT[key] = nil
-            end
-            for _, key in ipairs({ "visualRoot", "scriptGui", "gsRunGui" }) do
-                local obj = context.RT[key]
-                if obj then pcall(function() obj:Destroy() end) end
-                context.RT[key] = nil
-            end
-        end
-        if _G.DungeonAutofarmDestruct == context.destructScript then
-            _G.DungeonAutofarmDestruct = nil
-        end
-        if _G.DQRGildedV10Context == context then _G.DQRGildedV10Context = nil end
-    end
-
-    function bridge:initialize(components)
-        if not self.alive or self.loading then return false end
-        self.generation += 1
-        local token = self.generation
-        self.loadThread = coroutine.running()
-        self.loading, self.ready, self.armed = true, false, false
-        local context = {}
-        self.context = context
-        local order = {
-            "coreSettings", "attackCatalog", "gearProfiles", "movementBoost",
-            "hazardReader", "dangerGeometry", "odinMechanics", "bossPhases",
-            "bubbleBoss", "movementCombat", "inventoryAutomation", "partyQueue",
-            "raidAutomation", "uiLibrary", "drawing", "walls",
-            "statisticsWebhooks", "interfaceMainLoop",
-        }
-        for index, name in ipairs(order) do
-            if not self.alive or self.generation ~= token then
-                self:release(context)
-                return false
-            end
-            self:status(("LOADING %d/%d: %s"):format(index, #order, name))
-            local ok, err = xpcall(function()
-                assert(type(components[name]) == "function", "Missing component: " .. name)
-                components[name](context)
-                if name == "coreSettings" then
-                    local originalLog = context.log
-                    context.log = function(category, message)
-                        if originalLog then pcall(originalLog, category, message) end
-                        self:log(tostring(category) .. ": " .. tostring(message))
+        local availableSignals = {}
+        for _, signalName in ipairs({ "MouseButton1Click", "Activated" }) do
+            local ok, signal = pcall(function() return button[signalName] end)
+            if ok and signal then
+                table.insert(availableSignals, signal)
+                if type(getconnections) == "function" then
+                    local got, connections = pcall(getconnections, signal)
+                    if got and type(connections) == "table" then
+                        local count = 0
+                        for _, connection in ipairs(connections) do
+                            local fired = pcall(function()
+                                if type(connection.Fire) == "function" then connection:Fire()
+                                elseif type(connection.Function) == "function" then connection.Function()
+                                else error("No callable handler") end
+                            end)
+                            if fired then count += 1 end
+                        end
+                        if count > 0 then return count, signalName end
                     end
-                    local originalLoad = context.loadConfig
-                    context.loadConfig = function(...)
-                        local result = table.pack(originalLoad(...))
-                        self:holdStartup(context)
-                        return table.unpack(result, 1, result.n)
-                    end
-                    context.loadConfig()
-                    self:holdStartup(context)
                 end
-            end, function(reason)
-                return debug.traceback(tostring(reason), 2)
-            end)
-            if not ok then
-                self:release(context)
-                if self.generation == token then
-                    self.context, self.loading, self.ready = nil, false, false
-                    self.loadThread = nil
-                    self.lastError = name .. ": " .. tostring(err)
-                    self:status("LOAD ERROR: " .. name)
-                    self:log(self.lastError)
-                end
-                return false
             end
-            -- Yield between modules so the visible loading panel can update.
-            if hooks.yield then hooks.yield() end
         end
-        if not self.alive or self.generation ~= token then
-            self:release(context)
-            return false
+        -- Check BOTH handler lists before falling back: touch interfaces may
+        -- listen on Activated while MouseButton1Click has no connections.
+        if type(firesignal) == "function" then
+            local dispatched = 0
+            for _, signal in ipairs(availableSignals) do
+                if pcall(firesignal, signal) then dispatched += 1 end
+            end
+            if dispatched > 0 then return dispatched, "button signals" end
         end
-        self:holdStartup(context)
-        if context.Shell and context.Shell.setShown then pcall(context.Shell.setShown, false) end
-        self.loading, self.ready = false, true
-        self.loadThread = nil
-        self.lastError = nil
-        _G.DQRGildedV10Context = context
-        self:status("READY - press START")
-        self:log("All 18 reference components loaded; waiting for START")
-        return true
+        local ok, reason = pcall(function()
+            local pos, size = button.AbsolutePosition, button.AbsoluteSize
+            assert(size.X > 0 and size.Y > 0, "START button has no visible size")
+            local x, y = pos.X + size.X * 0.5, pos.Y + size.Y * 0.5
+            local screen = button:FindFirstAncestorWhichIsA("ScreenGui")
+            if screen and not screen.IgnoreGuiInset then
+                local inset = getService("GuiService"):GetGuiInset()
+                x, y = x + inset.X, y + inset.Y
+            end
+            local vim = context.VirtualInputManager or getService("VirtualInputManager")
+            local pressed, pressError = pcall(vim.SendMouseButtonEvent, vim, x, y, 0, true, game, 0)
+            local released, releaseError = pcall(vim.SendMouseButtonEvent, vim, x, y, 0, false, game, 0)
+            assert(pressed and released, tostring(pressError or releaseError))
+        end)
+        if ok then return 1, "mouse input" end
+        return 0, tostring(reason)
     end
-
-    function bridge:start(components)
-        if not self.alive or self.loading then return false end
-        if not self.context or (self.context.RT and self.context.RT.destroyed) then
-            if not self:initialize(components) then return false end
-        end
-        local context = self.context
-        if not context or not context.RT then return false end
-        self.armed = true
-        for _, key in ipairs(startupFlags) do
-            if self.desiredFlags[key] ~= nil then context.CFG[key] = self.desiredFlags[key] end
-        end
-        context.RT.farmEnabled = true
-        if context.setLoopButtonState then pcall(context.setLoopButtonState) end
-        if context.saveConfig then pcall(context.saveConfig) end
-        self:status("RUNNING")
-        self:log("Farm started with the complete reference engine")
-        return true
-    end
-
-    function bridge:stop(reason)
-        self.generation += 1
-        local thread = self.loadThread
-        self.loadThread = nil
-        if thread and hooks.cancel then pcall(hooks.cancel, thread) end
-        self.loading, self.ready, self.armed = false, false, false
-        local context = self.context
-        self.context = nil
-        self:release(context)
-        self:status(reason or "STOPPED - START reloads the engine")
-        self:log(reason or "Farm and engine stopped")
-    end
-
-    function bridge:destroy()
-        if not self.alive then return end
-        self:stop("HUB REMOVED")
-        self.alive = false
-        if hooks.destroy then pcall(hooks.destroy) end
-    end
-
-    function bridge:setOption(key, value)
-        local context = self.context
-        if not context or not context.CFG then return false end
-        context.CFG[key] = value
-        if context.refreshAllWidgets then pcall(context.refreshAllWidgets) end
-        if context.saveConfig then pcall(context.saveConfig) end
-        return true
-    end
-
-    function bridge:toggleSkills()
-        local cfg = self.context and self.context.CFG
-        if not cfg then return end
-        local enabled = not (cfg.autoQ or cfg.autoE)
-        cfg.autoQ, cfg.autoE = enabled, enabled
-        if self.context.refreshAllWidgets then pcall(self.context.refreshAllWidgets) end
-        if self.context.saveConfig then pcall(self.context.saveConfig) end
-    end
-
-    return bridge
 end
 
--- Compact Gilded panel: V9.5 layout, connected to the full reference engine.
-local function createCompactPanel(player, getService)
-    local pg = player:WaitForChild("PlayerGui", 15)
-    assert(pg, "PlayerGui unavailable after 15 seconds")
-    local connections, bridge, destroyed = {}, nil, false
-    local controls = {}
-    local colors = {
-        bg = Color3.fromRGB(18,22,32), panel = Color3.fromRGB(35,40,56),
-        pink = Color3.fromRGB(205,54,135), blue = Color3.fromRGB(56,82,126),
-        red = Color3.fromRGB(174,48,72), white = Color3.fromRGB(245,245,250),
-    }
-    local function make(className, parent, properties)
-        local object = Instance.new(className)
-        for key, value in pairs(properties) do object[key] = value end
-        object.Parent = parent
-        return object
-    end
-    local function rounded(object)
-        make("UICorner", object, {CornerRadius = UDim.new(0,7)})
-    end
-    local function connect(signal, fn)
-        local conn = signal:Connect(fn)
-        connections[#connections + 1] = conn
-        return conn
-    end
-    local gui = make("ScreenGui", pg, {
-        Name = "GildedHubV10Integrated", ResetOnSpawn = false,
-        IgnoreGuiInset = true, DisplayOrder = 99999,
-        ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
-    })
-    local frame = make("Frame", gui, {
-        Size = UDim2.fromOffset(370,382), Position = UDim2.fromOffset(15,65),
-        BackgroundColor3 = colors.bg, BorderSizePixel = 0,
-    })
-    rounded(frame)
-    local function button(parent, text, x,y,w,h,color)
-        local obj = make("TextButton", parent, {
-            Text = text, TextSize = 12, Font = Enum.Font.GothamBold,
-            TextColor3 = colors.white, BackgroundColor3 = color or colors.panel,
-            BorderSizePixel = 0, Position = UDim2.fromOffset(x,y),
-            Size = UDim2.fromOffset(w,h), TextWrapped = true,
-        })
-        rounded(obj)
-        return obj
-    end
-    local function label(parent,text,x,y,w,h)
-        return make("TextLabel", parent, {
-            Text = text, TextSize = 12, Font = Enum.Font.Gotham,
-            TextColor3 = colors.white, TextWrapped = true,
-            TextXAlignment = Enum.TextXAlignment.Left,
-            BackgroundTransparency = 1, Position = UDim2.fromOffset(x,y),
-            Size = UDim2.fromOffset(w,h),
-        })
-    end
-    local title = button(frame,"GILDED HUB V10",7,7,207,35,colors.pink)
-    local minus = button(frame,"-",219,7,43,35)
-    local plus = button(frame,"+",267,7,43,35)
-    local hide = button(frame,"X",315,7,47,35,colors.red)
-    local tabs, pages = {}, {}
-    for i,name in ipairs({"FARM","COMBAT","SENSORS","DEBUG"}) do
-        tabs[i] = button(frame,name,7,54+(i-1)*63,78,53,i==1 and colors.pink or colors.panel)
-        pages[i] = make("Frame",frame,{
-            Size = UDim2.fromOffset(269,281), Position = UDim2.fromOffset(93,53),
-            BackgroundColor3 = colors.panel, BorderSizePixel = 0, Visible = i==1,
-        })
-        rounded(pages[i])
-        local selected = i
-        connect(tabs[i].Activated,function()
-            for j,page in ipairs(pages) do
-                page.Visible = j==selected
-                tabs[j].BackgroundColor3 = j==selected and colors.pink or colors.panel
-            end
-        end)
-    end
-    local farm, combat, sensors, debugPage = pages[1],pages[2],pages[3],pages[4]
-    label(farm,"FULL REFERENCE ENGINE / 18 COMPONENTS",8,3,253,24)
-    controls.start = button(farm,"LOADING ENGINE...",8,31,253,37,colors.pink)
-    controls.skills = button(farm,"AUTO Q + E",8,73,253,29,colors.pink)
-    controls.resume = button(farm,"RESUME AFTER RESPAWN: ON",8,107,253,29,colors.pink)
-    controls.settings = button(farm,"ALL FEATURES / FULL SETTINGS",8,141,253,34,colors.blue)
-    controls.stop = button(farm,"EMERGENCY STOP",8,181,253,34,colors.red)
-    label(farm,"Boss logic, inventory, parties, raids, maps and visuals are in Full Settings.",8,222,253,53)
-    label(combat,"REFERENCE SKILL / BUFF ROTATION",8,3,253,24)
-    controls.testQ = button(combat,"TEST Q",8,32,122,32,colors.blue)
-    controls.testE = button(combat,"TEST E",139,32,122,32,colors.blue)
-    label(combat,"BUFF COOLDOWN",8,70,253,18)
-    controls.cdMinus = button(combat,"-0.5",8,92,76,29)
-    controls.cd = button(combat,"6.0s",92,92,85,29,colors.blue)
-    controls.cdPlus = button(combat,"+0.5",185,92,76,29)
-    label(combat,"BUFF DURATION",8,128,253,18)
-    controls.buffMinus = button(combat,"-0.5",8,150,76,29)
-    controls.buff = button(combat,"5.0s",92,150,85,29,colors.blue)
-    controls.buffPlus = button(combat,"+0.5",185,150,76,29)
-    controls.face = button(combat,"FACE TARGET",8,188,253,30,colors.pink)
-    controls.look = button(combat,"LOOK AWAY",8,224,253,30,colors.pink)
-    controls.enemyText = label(sensors,"TARGET: NONE",8,7,253,42)
-    controls.health = label(sensors,"TARGET HP: -",8,53,253,24)
-    controls.distance = label(sensors,"DISTANCE: -",8,82,253,24)
-    controls.hazards = label(sensors,"HAZARDS: 0",8,111,253,24)
-    controls.mode = label(sensors,"ENGINE: LOADING",8,140,253,60)
-    controls.rescan = button(sensors,"REFRESH HAZARD READER",8,211,253,32,colors.blue)
-    controls.debugText = label(debugPage,"Loading...",8,7,253,191)
-    controls.debugText.TextSize = 11
-    controls.debugText.TextYAlignment = Enum.TextYAlignment.Top
-    controls.retry = button(debugPage,"RELOAD ENGINE",8,207,122,32,colors.blue)
-    controls.remove = button(debugPage,"REMOVE HUB",139,207,122,32,colors.red)
-    label(debugPage,"Source: user-provided Harvard Labs v3.0 c84b",8,244,253,31).TextSize=10
-    controls.footer = label(frame,"STATE: LOADING",8,339,354,36)
-    local reopen = button(gui,"OPEN GILDED HUB",15,70,152,40,colors.pink)
-    reopen.Visible = false
-    local floatStop = button(gui,"STOP FARM",173,70,118,40,colors.red)
-    floatStop.Visible = false
-    local scale = make("UIScale",frame,{Scale=0.9})
-    local scales, scaleIndex = {0.65,0.8,0.9,1,1.15,1.3}, 3
-    connect(minus.Activated,function()
-        scaleIndex=math.max(1,scaleIndex-1); scale.Scale=scales[scaleIndex]
-    end)
-    connect(plus.Activated,function()
-        scaleIndex=math.min(#scales,scaleIndex+1); scale.Scale=scales[scaleIndex]
-    end)
-    connect(hide.Activated,function()
-        frame.Visible=false; reopen.Visible=true
-        floatStop.Visible = bridge and (bridge.loading or bridge.armed) or false
-    end)
-    connect(reopen.Activated,function()
-        frame.Visible=true; reopen.Visible=false; floatStop.Visible=false
-    end)
-    local uis = getService("UserInputService")
-    local dragging, dragStart, dragOrigin, touch
-    connect(title.InputBegan,function(input)
-        if input.UserInputType==Enum.UserInputType.Touch or input.UserInputType==Enum.UserInputType.MouseButton1 then
-            dragging=true; dragStart=input.Position; dragOrigin=frame.Position
-            touch=input.UserInputType==Enum.UserInputType.Touch and input or nil
-        end
-    end)
-    connect(uis.InputChanged,function(input)
-        if not dragging or (touch and touch~=input) then return end
-        if not touch and input.UserInputType~=Enum.UserInputType.MouseMovement then return end
-        local delta=input.Position-dragStart
-        frame.Position=UDim2.fromOffset(dragOrigin.X.Offset+delta.X,dragOrigin.Y.Offset+delta.Y)
-    end)
-    connect(uis.InputEnded,function(input)
-        if (touch and touch==input) or (not touch and input.UserInputType==Enum.UserInputType.MouseButton1) then
-            dragging=false; touch=nil
-        end
-    end)
-    local heldKey, keyBusy, keyGeneration = nil, false, 0
-    local function releaseKey()
-        keyGeneration += 1
-        local key=heldKey; heldKey=nil
-        for _, released in ipairs({Enum.KeyCode.Q,Enum.KeyCode.E}) do
-            pcall(function() getService("VirtualInputManager"):SendKeyEvent(false,released,false,game) end)
-        end
-        if key and key~=Enum.KeyCode.Q and key~=Enum.KeyCode.E then
-            pcall(function() getService("VirtualInputManager"):SendKeyEvent(false,key,false,game) end)
-        end
-        keyBusy=false
-    end
-    local function testKey(key)
-        if not bridge or not bridge.alive or keyBusy or bridge.loading then return end
-        if bridge.context and bridge.context.RT and bridge.context.RT.farmEnabled then
-            bridge:log("Pause Autofarm in Full Settings before testing an individual key")
-            return
-        end
-        keyBusy=true
-        keyGeneration += 1
-        local token=keyGeneration
-        local ok,err=pcall(function()
-            heldKey=key
-            getService("VirtualInputManager"):SendKeyEvent(true,key,false,game)
-            task.wait(0.08)
-        end)
-        if token==keyGeneration then releaseKey() end
-        if not ok then bridge:log("INPUT ERROR: "..tostring(err)) end
-    end
-    local hooks = {}
-    function hooks.status(message)
-        if not destroyed then controls.footer.Text="STATE: "..message end
-    end
-    function hooks.log(_,history)
-        if destroyed then return end
-        local lines={}
-        for i=1,math.min(6,#history) do lines[i]=history[i]:sub(1,170) end
-        controls.debugText.Text=table.concat(lines,"\n\n")
-    end
-    function hooks.yield() task.wait() end
-    function hooks.cancel(thread)
-        if thread~=coroutine.running() and coroutine.status(thread)~="dead" then task.cancel(thread) end
-    end
-    hooks.releaseInput=releaseKey
-    function hooks.destroy()
-        if destroyed then return end
-        destroyed=true
-        releaseKey()
-        for _,conn in ipairs(connections) do pcall(function() conn:Disconnect() end) end
-        table.clear(connections)
-        pcall(function() gui:Destroy() end)
-    end
-    local panel = {hooks=hooks, gui=gui, controls=controls}
-    function panel:bind(adapter,components)
-        bridge=adapter
-        local function launch(start)
-            if bridge.loading or not bridge.alive then return end
-            task.spawn(function()
-                if start then bridge:start(components) else bridge:initialize(components) end
-            end)
-        end
-        connect(controls.start.Activated,function()
-            if bridge.loading then return end
-            if bridge.context and bridge.context.RT and bridge.context.RT.farmEnabled then
-                releaseKey(); bridge:stop()
-            else launch(true) end
-        end)
-        local function stop()
-            releaseKey(); bridge:stop("EMERGENCY STOP - press START to reload")
-        end
-        connect(controls.stop.Activated,stop)
-        connect(floatStop.Activated,stop)
-        connect(controls.skills.Activated,function() bridge:toggleSkills() end)
-        connect(controls.resume.Activated,function() bridge.resumeAfterDeath=not bridge.resumeAfterDeath end)
-        connect(controls.settings.Activated,function()
-            local context=bridge.context
-            if not context then bridge:log("Press RELOAD ENGINE before opening Full Settings"); return end
-            if context.Shell and context.Shell.setShown then
-                local shown=context.Shell.isShown and context.Shell.isShown() or false
-                local ok,err=pcall(context.Shell.setShown,not shown)
-                if not ok then bridge:log("SETTINGS: "..tostring(err)) end
-                if not shown then
-                    frame.Visible=false; reopen.Visible=true
-                    floatStop.Visible=bridge.armed
-                end
-            else bridge:log("Full Settings is unavailable: check the startup error") end
-        end)
-        local function option(key)
-            local cfg=bridge.context and bridge.context.CFG
-            if cfg then bridge:setOption(key,cfg[key]==false) end
-        end
-        connect(controls.face.Activated,function() option("faceTarget") end)
-        connect(controls.look.Activated,function() option("gsLookAway") end)
-        local function adjust(key,delta,minimum,maximum)
-            local context=bridge.context
-            if not context then return end
-            if context.RT.farmEnabled then bridge:log("Stop Autofarm in Full Settings before changing buff timing"); return end
-            bridge:setOption(key,math.clamp((tonumber(context.CFG[key]) or minimum)+delta,minimum,maximum))
-        end
-        connect(controls.cdMinus.Activated,function() adjust("buffCooldown",-0.5,1,30) end)
-        connect(controls.cdPlus.Activated,function() adjust("buffCooldown",0.5,1,30) end)
-        connect(controls.buffMinus.Activated,function() adjust("buffDuration",-0.5,0.5,15) end)
-        connect(controls.buffPlus.Activated,function() adjust("buffDuration",0.5,0.5,15) end)
-        connect(controls.testQ.Activated,function() task.spawn(testKey,Enum.KeyCode.Q) end)
-        connect(controls.testE.Activated,function() task.spawn(testKey,Enum.KeyCode.E) end)
-        connect(controls.rescan.Activated,function()
-            local context=bridge.context
-            if context and context.readerTick then
-                local ok,err=pcall(context.readerTick,os.clock())
-                bridge:log(ok and "Hazard reader refreshed" or "READER: "..tostring(err))
-            end
-        end)
-        connect(controls.retry.Activated,function()
-            releaseKey(); bridge:stop("RELOADING ENGINE"); launch(false)
-        end)
-        connect(controls.remove.Activated,function() bridge:destroy() end)
-        connect(gui.Destroying,function() if bridge.alive then bridge:destroy() end end)
-        connect(player.CharacterRemoving,function()
-            local rt=bridge.context and bridge.context.RT
-            if rt and rt.farmEnabled and not bridge.resumeAfterDeath then
-                releaseKey(); bridge:stop("RESPAWN RESUME OFF - farm stopped")
-            end
-        end)
-        local lastUI=0
-        local function paintToggle(obj,text,enabled)
-            obj.Text=text..(enabled and ": ON" or ": OFF")
-            obj.BackgroundColor3=enabled and colors.pink or colors.blue
-        end
-        connect(getService("RunService").Heartbeat,function()
-            if destroyed or os.clock()-lastUI<0.25 then return end
-            lastUI=os.clock()
-            local context=bridge.context
-            local rt=context and context.RT
-            local cfg=context and context.CFG
-            local running=rt and rt.farmEnabled and not rt.destroyed
-            controls.start.Text=bridge.loading and "LOADING ENGINE..."
-                or running and "STOP AUTOFARM" or "START AUTOFARM"
-            floatStop.Visible=not frame.Visible and (bridge.loading or bridge.armed or running)
-            paintToggle(controls.resume,"RESUME AFTER RESPAWN",bridge.resumeAfterDeath)
-            if cfg then
-                paintToggle(controls.skills,"AUTO Q + E",cfg.autoQ or cfg.autoE)
-                paintToggle(controls.face,"FACE TARGET",cfg.faceTarget~=false)
-                paintToggle(controls.look,"LOOK AWAY",cfg.gsLookAway~=false)
-                controls.cd.Text=("%.1fs"):format(tonumber(cfg.buffCooldown) or 6)
-                controls.buff.Text=("%.1fs"):format(tonumber(cfg.buffDuration) or 5)
-            end
-            local target=context and context.BR and context.BR.target
-            local model=target and target.model
-            controls.enemyText.Text="TARGET: "..tostring(model and model.Name or target and target.name or "NONE")
-            controls.health.Text="TARGET HP: "..(target and target.humanoid and ("%.0f / %.0f"):format(target.humanoid.Health,target.humanoid.MaxHealth) or "-")
-            local distance
-            if target and target.root and player.Character then
-                local root=player.Character:FindFirstChild("HumanoidRootPart")
-                if root and target.root.Parent then distance=(root.Position-target.root.Position).Magnitude end
-            end
-            controls.distance.Text="DISTANCE: "..(distance and ("%.1f studs"):format(distance) or "-")
-            controls.hazards.Text="HAZARDS: "..tostring(context and context.RD and context.RD.count or 0)
-            controls.mode.Text="ENGINE: "..tostring(rt and rt.movementState or bridge.statusText or "OFF")
-            if not bridge.loading then
-                local err=rt and rt.lastError or bridge.lastError
-                if err then controls.footer.Text="ERROR: "..tostring(err):sub(1,150)
-                elseif running then controls.footer.Text="STATE: "..tostring(rt.movementState or "RUNNING")
-                else controls.footer.Text="STATE: "..tostring(bridge.statusText or "READY") end
-            end
-        end)
-    end
-    return panel
-end
-
--- Stop prior hub versions before constructing the new compact panel.
+-- Remove an earlier V9/V10/V11 copy before loading the single Harvard menu.
 do
     local seen = {}
-    for _, cleanup in pairs({ _G.DQRGildedV10Cleanup, _G.GS9Cleanup, _G.DungeonAutofarmDestruct }) do
-        if type(cleanup) == "function" and not seen[cleanup] then
-            seen[cleanup] = true
-            local ok, err = pcall(cleanup)
-            if not ok then warn("[DQR V10] Previous cleanup: " .. tostring(err)) end
-        end
+    for _, cleanup in pairs({ _G.DQRGildedV11Cleanup, _G.DQRGildedV10Cleanup, _G.GS9Cleanup, _G.DungeonAutofarmDestruct }) do
+        if type(cleanup) == "function" and not seen[cleanup] then seen[cleanup]=true; pcall(cleanup) end
     end
 end
-local panel = createCompactPanel(player, getService)
-local integration = createIntegration(panel.hooks)
 local components = {}
 
 
@@ -1853,7 +1379,9 @@ components.coreSettings = function(context)
     config.autoQueueReplay = false
     config.autoQueueReplayDelay = 2
     config.autoFarmByPlace = true
-    config.autoStartDungeon = false
+    config.autoStartDungeon = true
+    config.gsAutoStart = true
+    config.gsRunButtons = false
     config.autoStartDelay = 2
     config.autoStartWalkMax = 60
     config.startTimed = true
@@ -2016,7 +1544,7 @@ components.coreSettings = function(context)
         return value2 > 0 and value / value2 or nil
     end
     local runtimeState =
-        { farmEnabled = false, destroyed = false, movementState = "starting", tickMs = 0, moveBoost = false }
+        { farmEnabled = true, destroyed = false, movementState = "starting", tickMs = 0, moveBoost = false }
     runtimeState.lastQ = -math.huge
     runtimeState.lastE = -math.huge
     runtimeState.lastClick = -math.huge
@@ -119730,6 +119258,7 @@ components.partyQueue = function(context)
         end
         if
             (game.PlaceId == 101088859550383 or HLGSF == true)
+            and config.autoStartDungeon ~= false
             and config.gsAutoStart ~= false
             and not (context.MD and context.MD.halted)
         then
@@ -119777,33 +119306,16 @@ components.partyQueue = function(context)
                     local value16 = value15 and (value15:FindFirstChild("TextButton", true))
                     if value16 and value15.Visible then
                         sharedValue.lastStartPress = argument
-                        local value17 = 0
-                        pcall(function()
-                            if getconnections then
-                                local iterateArray, value18 =
-                                    ipairs, argumentHelpers[108](getconnections(value16.MouseButton1Click))
-                                for key, entry in iterateArray(argumentHelpers:unpackValues(value18)) do
-                                    task.spawn(function()
-                                        pcall(function()
-                                            entry:Fire()
-                                        end)
-                                    end)
-                                    value17 += 1
-                                end
-                            elseif firesignal then
-                                firesignal(value16.MouseButton1Click)
-                                value17 = 1
+                        local value17, startMethod = context.pressDungeonStart(value16)
+                        if value17 > 0 then
+                            log("Queue", "Gilded Skies: START dispatched via " .. tostring(startMethod))
+                            if context.notify then
+                                context.notify("run", "Starting the run", "Gilded Skies: START pressed.")
                             end
-                        end)
-                        log(
-                            "Queue",
-                            ("gs-test: START pressed (%s, %d click handler(s))"):format(
-                                tostring(sharedValue.startWhy),
-                                value17
-                            )
-                        )
-                        if context.notify then
-                            context.notify("run", "Starting the run", "Gilded Skies: START pressed.")
+                        else
+                            runtimeState.lastError = "Auto-start: " .. tostring(startMethod)
+                            runtimeState.lastErrorAt = argument
+                            log("Queue", runtimeState.lastError)
                         end
                     else
                         sharedValue.startWhy = "no START button on screen"
@@ -119812,7 +119324,9 @@ components.partyQueue = function(context)
             end
         end
         if farmEnabled then
-            if value then
+            if config.autoStartDungeon ~= false and (
+                value or not (context.AF and context.AF.role and context.AF.role())
+            ) then
                 if not (context.MD and context.MD.halted) then
                     if game.PlaceId ~= 101088859550383 then
                         if HLGSF ~= true then
@@ -143741,6 +143255,10 @@ components.interfaceMainLoop = function(context)
             return
         end
         runtimeState.destroyed = true
+        if context._bootstrapTeleport then
+            pcall(function() context._bootstrapTeleport:Disconnect() end)
+            context._bootstrapTeleport = nil
+        end
         pcall(saveConfig)
         pcall(function()
             local hlBeamWalls = workspaceService:FindFirstChild("HLBeamWalls")
@@ -146628,6 +146146,19 @@ components.interfaceMainLoop = function(context)
                 )
             end
         end, 0, "The master switch. Off in the lobby and on in a dungeon by itself.")).render
+        helper(uiLibrary.toggle(
+            runsThisAccount,
+            "Auto start dungeon",
+            function() return config.autoStartDungeon ~= false end,
+            function(enabled)
+                config.autoStartDungeon = enabled
+                config.gsAutoStart = enabled
+                saveConfig()
+            end,
+            1,
+            "Press START automatically after the dungeon is ready. Gilded Skies still waits for the party and loadout."
+        ))
+
         helper15(
             runsThisAccount,
             "Stay for the bonus boss",
@@ -165237,25 +164768,79 @@ components.interfaceMainLoop = function(context)
         end
     end)
 end
--- Both interfaces share this one engine/context. The V9.5 movement loop is
--- deliberately replaced by the complete reference controller, not run beside it.
-panel:bind(integration, components)
-local function cleanupIntegratedHub()
-    integration:destroy()
-    if _G.DQRGildedV10Cleanup == cleanupIntegratedHub then _G.DQRGildedV10Cleanup = nil end
-    if _G.GS9Cleanup == cleanupIntegratedHub then _G.GS9Cleanup = nil end
-end
-_G.DQRGildedV10Cleanup = cleanupIntegratedHub
-_G.GS9Cleanup = cleanupIntegratedHub
-integration:log("V10 compact panel ready; loading all 18 reference components")
-task.spawn(function()
-    local ok, err = xpcall(function()
-        integration:initialize(components)
-    end, function(reason) return debug.traceback(tostring(reason), 2) end)
-    if not ok and integration.alive then
-        integration:stop("STARTUP ERROR - see DEBUG")
-        integration.lastError = tostring(err)
-        integration:log(err)
+local context = {}
+local stopped = false
+local currentStage = "boot"
+local function stopHarvardEngine()
+    if stopped then return end
+    stopped = true
+    if context.RT then context.RT.farmEnabled = false end
+    if context.destructScript then pcall(context.destructScript) end
+    if context.RT then context.RT.destroyed = true end
+    for _, method in ipairs({ "readerStop", "clearDrawing" }) do
+        if context[method] then pcall(context[method]) end
     end
-end)
-return integration
+    if context.LC and context.LC.stop then pcall(context.LC.stop) end
+    if context.BB and context.BB.stop then pcall(context.BB.stop) end
+    for _, conn in ipairs(context.sliderConnections or {}) do pcall(function() conn:Disconnect() end) end
+    if context._bootstrapTeleport then pcall(function() context._bootstrapTeleport:Disconnect() end) end
+    if context.RT then
+        for _, key in ipairs({ "mainConnection", "hudConnection", "streamerConnection" }) do
+            local conn = context.RT[key]
+            if conn then pcall(function() conn:Disconnect() end) end
+        end
+        for _, key in ipairs({ "scriptGui", "visualRoot", "gsRunGui" }) do
+            local gui = context.RT[key]
+            if gui then pcall(function() gui:Destroy() end) end
+        end
+    end
+    if _G.DQRGildedV11Context == context then _G.DQRGildedV11Context = nil end
+    if _G.DQRGildedV11Cleanup == stopHarvardEngine then _G.DQRGildedV11Cleanup = nil end
+    if _G.GS9Cleanup == stopHarvardEngine then _G.GS9Cleanup = nil end
+end
+_G.DQRGildedV11Cleanup = stopHarvardEngine
+_G.GS9Cleanup = stopHarvardEngine
+local ok, reason = xpcall(function()
+    local order = {
+        "coreSettings", "attackCatalog", "gearProfiles", "movementBoost",
+        "hazardReader", "dangerGeometry", "odinMechanics", "bossPhases",
+        "bubbleBoss", "movementCombat", "inventoryAutomation", "partyQueue",
+        "raidAutomation", "uiLibrary", "drawing", "walls",
+        "statisticsWebhooks", "interfaceMainLoop",
+    }
+    for index, name in ipairs(order) do
+        if stopped then return end
+        currentStage = name
+        print(("[DQR Harvard V11] Loading %d/18: %s"):format(index, name))
+        components[name](context)
+        if name == "coreSettings" then
+            installHarvardAutoStart(context)
+            context.loadConfig()
+        end
+        task.wait()
+    end
+    if stopped then return end
+    context.INTEGRATION_VERSION = "V11 Harvard single menu"
+    local dungeon = context.Workspace:FindFirstChild("dungeonName")
+    local inDungeon = game.PlaceId == 101088859550383
+        or dungeon and dungeon:IsA("StringValue") and dungeon.Value ~= ""
+    context.RT.farmEnabled = inDungeon == true
+    if context.setLoopButtonState then pcall(context.setLoopButtonState) end
+    if context.Shell and context.Shell.setShown then pcall(context.Shell.setShown, true) end
+    _G.DQRGildedV11Context = context
+    if context.notify then
+        context.notify("run", "Harvard ready", "Auto-start dungeon: " .. (context.CFG.autoStartDungeon ~= false and "ON" or "OFF") .. ". All controls are in this menu.")
+    end
+    print("[DQR Harvard V11] Ready: Harvard menu only; auto-start " .. tostring(context.CFG.autoStartDungeon ~= false))
+end, function(err) return debug.traceback(tostring(err), 2) end)
+if not ok then
+    warn("[DQR Harvard V11] " .. currentStage .. ": " .. tostring(reason))
+    stopHarvardEngine()
+    pcall(function()
+        getService("StarterGui"):SetCore("SendNotification", {
+            Title = "Harvard startup error",
+            Text = currentStage .. ": " .. tostring(reason):sub(1,140), Duration = 15,
+        })
+    end)
+end
+return context
