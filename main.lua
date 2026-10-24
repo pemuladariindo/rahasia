@@ -1,13 +1,11 @@
 --[[
-DQR GILDED V22 - HARVARD / KNIGHT KEEPOUT / MAGE MARGIN
+DQR GILDED V22_1 - HARVARD / SPACING ROLLBACK
 Run this complete file once. It saves its bundled engine in the executor's local
 workspace and runs it. No HTTP downloads or external code are used.
 
-Ranged NPC keepout starts outside the known Knight circle before its marker appears.
-Mage predictions reserve additional time for network latency and frame delay.
-Cross previews, exact route intervals and terrain-diverse exits are retained.
-Dodge reports identify each life and include three recent death snapshots.
-The restored boss controller, V18 EIF fix and saved speed choice are retained.
+Restores V21 NPC proximity spacing after reproducing a V22 beam-escape regression.
+Actual Knight circle markers still use their full observed footprint.
+Mage timing margin, character-route reset and per-life death reports are retained.
 Harvard > Autofarm:
 - Mob dodge assist / Predict mage windups (ON by default)
 - Record dodge reports / Copy dodge report / Save dodge report
@@ -30,7 +28,7 @@ local env = type(getgenv) == "function" and getgenv() or _G
 local payload = [=====[
 -- DQR_HARVARD_RUNTIME_V12
 --[[
-DQR HARVARD V22 RUNTIME
+DQR HARVARD V22.1 RUNTIME
 All 18 user-supplied reference components; Harvard menu only.
 Per-account save/load, autosave and teleport auto-execute are available in Autofarm.
 This local cached engine is installed by DQR_Gilded_V12_AutoExec.lua.
@@ -356,7 +354,7 @@ local function installHarvardPersistence(context)
 end
 
 -- NPC-only escape patterns. Boss frames always return to the original brain.
--- V22 anticipates Knight approaches and budgets latency before mage impact.
+-- V22.1 restores V21 proximity spacing; keeps timing margin and lifecycle fixes.
 local function installMobReflex(context)
     local cfg, rt, rd = context.CFG, context.RT, context.RD
     local state = {active=false, mode="IDLE", zones={}, raw={}, lastRead=-math.huge,
@@ -629,22 +627,20 @@ local function installMobReflex(context)
             for _,e in ipairs(rd.enemies or {}) do
                 if not e.isBoss and e.melee and alive(e) then
                     local pos=e.root.Position
-                    local knight=string.lower(tostring(e.model and e.model.Name or "")):find("knight",1,true)~=nil
-                    if abs(pos.Y-origin.Y)<(knight and 16 or 10) and distance(origin,pos)<65 then
+                    if abs(pos.Y-origin.Y)<10 and distance(origin,pos)<65 then
                         local radius=min(12,max(3,tonumber(e.meleeDistance) or 4))
                             +min(10,max(1,tonumber(e.extent) or 3))+1.5
-                        -- The recorded Knight circle has radius 18. Waiting
-                        -- for ordinary 4-stud melee range leaves a ranged
-                        -- character inside its approach/leap before a marker.
-                        if knight then radius=max(radius,22) end
+                        -- Do not turn an unobserved radius-18 Knight attack
+                        -- into a permanent hard obstacle around a moving NPC.
+                        -- Actual circle markers still retain their full radius.
                         local vx,vz=tonumber(e.vx) or 0,tonumber(e.vz) or 0
                         local v=sqrt(vx*vx+vz*vz)
-                        local zone={name=knight and "knight approach" or "mob melee space",spacing=true,enemy=e,
-                            cx=pos.X,cy=pos.Y,cz=pos.Z,r=radius,hy=knight and 10 or 4,from=now,untilAt=math.huge}
+                        local zone={name="mob melee space",spacing=true,enemy=e,
+                            cx=pos.X,cy=pos.Y,cz=pos.Z,r=radius,hy=4,from=now,untilAt=math.huge}
                         if v>0.1 then
                             zone.moving=true;zone.ox=pos.X;zone.oy=pos.Y;zone.oz=pos.Z
                             zone.dx=vx/v;zone.dz=vz/v;zone.speed=min(v,32)
-                            zone.pathStart=now;zone.endAlong=zone.speed*(knight and min(0.75,0.55+latency()) or 0.4)
+                            zone.pathStart=now;zone.endAlong=zone.speed*0.4
                         end
                         state.zones[#state.zones+1]=zone;state.spaceCount+=1
                     end
@@ -1138,7 +1134,7 @@ end
 -- Bounded local replay of movement decisions. No network requests or movement.
 local function installDodgeReports(context)
     local cfg,rt=context.CFG,context.RT
-    local report={frames={},deaths={},life=0,status="V22: recording dodge decisions",lastSample=-math.huge,
+    local report={frames={},deaths={},life=0,status="V22.1: recording dodge decisions",lastSample=-math.huge,
         lastCaption=-math.huge,path="DQR_GildedV10/logs/dodge_last_death.json"}
     context.dodgeReports=report
     if cfg.harvardDodgeReports==nil then cfg.harvardDodgeReports=true end
@@ -1159,7 +1155,7 @@ local function installDodgeReports(context)
         local frames,deaths={},{}
         for i,frame in ipairs(report.frames) do frames[i]=frame end
         for i,death in ipairs(report.deaths) do deaths[i]=death end
-        return {version="V22",reason=reason,at=now,place_id=game.PlaceId,
+        return {version="V22.1",reason=reason,at=now,place_id=game.PlaceId,
             class=cfg.classProfile,npc_assist=cfg.harvardMobDodge~=false,
             speed21=cfg.harvardSpeed21~=false,life=report.life,recent_deaths=deaths,frames=frames}
     end
@@ -1186,7 +1182,7 @@ local function installDodgeReports(context)
     end
     function context.harvardSaveDodgeReport()
         local ok,result=persist(latest())
-        report.status=ok and "V22: dodge report saved" or "V22: report save failed"
+        report.status=ok and "V22.1: dodge report saved" or "V22.1: report save failed"
         message("Dodge report",ok and ("Saved "..report.path) or tostring(result))
         return ok,result
     end
@@ -1205,7 +1201,7 @@ local function installDodgeReports(context)
         if now-report.lastCaption<0.5 then return end
         report.lastCaption=now
         local mob=context.mobDodge
-        local text=cfg.harvardDodgeReports==false and "V22: dodge recording OFF" or report.status
+        local text=cfg.harvardDodgeReports==false and "V22.1: dodge recording OFF" or report.status
         if mob then
             text=text.." | NPC: "..tostring(mob.mode).." | read/used "
                 ..tostring(mob.sourceCount or 0).."/"..tostring(mob.acceptedCount or 0)
@@ -1314,8 +1310,8 @@ local function installDodgeReports(context)
             if #report.deaths>3 then table.remove(report.deaths,1) end
             report.lastDeath=build("death",now)
             local ok,result=persist(report.lastDeath)
-            report.status=ok and "V22: last death saved; Copy dodge report"
-                or "V22: last death buffered; Copy dodge report"
+            report.status=ok and "V22.1: last death saved; Copy dodge report"
+                or "V22.1: last death buffered; Copy dodge report"
             report.saveError=not ok and tostring(result) or nil
         end
     end
@@ -1323,7 +1319,7 @@ local function installDodgeReports(context)
     context.sliderConnections=context.sliderConnections or {}
     context.sliderConnections[#context.sliderConnections+1]=runService.Heartbeat:Connect(function()
         local ok,err=pcall(context.dodgeReportTick,os.clock())
-        if not ok then report.status="V22: report error";report.error=tostring(err) end
+        if not ok then report.status="V22.1: report error";report.error=tostring(err) end
     end)
 end
 
@@ -147404,7 +147400,7 @@ components.interfaceMainLoop = function(context)
         end, function(enabled)
             config.harvardMobDodge=enabled
             saveConfig()
-        end, 6, "Earlier Knight keepout, additional mage impact margin and per-life death diagnostics."))
+        end, 6, "V21 proximity spacing restored; mage impact margin and per-life diagnostics retained."))
         helper(uiLibrary.toggle(runsThisAccount, "Speed 21 (experimental)", function()
             return config.harvardSpeed21 ~= false
         end, function(enabled)
@@ -147428,7 +147424,7 @@ components.interfaceMainLoop = function(context)
             "Copy the last death's movement report, or the current report if there has been no death.")
         dodgeReportRow.add("Save dodge report", "secondary", function() context.harvardSaveDodgeReport() end,
             "Save the report as DQR_GildedV10/logs/dodge_last_death.json in the executor workspace.")
-        context.dodgeReports.caption=uiLibrary.label(runsThisAccount,"V22: recording dodge decisions","captionSub",10)
+        context.dodgeReports.caption=uiLibrary.label(runsThisAccount,"V22.1: recording dodge decisions","captionSub",10)
         context.dodgeReports.caption.Size=UDim2.new(1,0,0,38)
         context.dodgeReports.caption.TextWrapped=true
         local persistenceRow = uiLibrary.buttonRow(runsThisAccount, 3)
@@ -166117,7 +166113,7 @@ local ok, reason = xpcall(function()
     for index, name in ipairs(order) do
         if stopped then return end
         currentStage = name
-        print(("[DQR Harvard V22] Loading %d/18: %s"):format(index, name))
+        print(("[DQR Harvard V22.1] Loading %d/18: %s"):format(index, name))
         components[name](context)
         if name == "movementCombat" then
             installBossRecoveryMovement(context)
@@ -166134,7 +166130,7 @@ local ok, reason = xpcall(function()
         task.wait()
     end
     if stopped then return end
-    context.INTEGRATION_VERSION = "V22 Harvard Knight keepout and mage margin"
+    context.INTEGRATION_VERSION = "V22.1 Harvard spacing rollback"
     context.harvardPersistence.refresh()
     pcall(context.saveConfig)
     local dungeon = context.Workspace:FindFirstChild("dungeonName")
@@ -166149,10 +166145,10 @@ local ok, reason = xpcall(function()
     if context.notify then
         context.notify("run", "Harvard ready", "Auto-start dungeon: " .. (context.CFG.autoStartDungeon ~= false and "ON" or "OFF") .. ". All controls are in this menu.")
     end
-    print("[DQR Harvard V22] Ready: Harvard menu only; auto-start " .. tostring(context.CFG.autoStartDungeon ~= false))
+    print("[DQR Harvard V22.1] Ready: Harvard menu only; auto-start " .. tostring(context.CFG.autoStartDungeon ~= false))
 end, function(err) return debug.traceback(tostring(err), 2) end)
 if not ok then
-    warn("[DQR Harvard V22] " .. currentStage .. ": " .. tostring(reason))
+    warn("[DQR Harvard V22.1] " .. currentStage .. ": " .. tostring(reason))
     stopHarvardEngine()
     pcall(function()
         getService("StarterGui"):SetCore("SendNotification", {
@@ -166175,8 +166171,8 @@ local cached, cacheError = pcall(function()
     assert(readfile(cachePath)==payload, "saved engine verification failed")
 end)
 env.DQRHarvardCacheReady = cached
-if not cached then warn("[DQR Harvard V22] Auto-execute cache unavailable: "..tostring(cacheError)) end
+if not cached then warn("[DQR Harvard V22_1] Auto-execute cache unavailable: "..tostring(cacheError)) end
 assert(type(loadstring)=="function", "Executor loadstring is required to run the bundled engine")
-local run, compileError = loadstring(payload,"@DQR_Harvard_V22")
+local run, compileError = loadstring(payload,"@DQR_Harvard_V22_1")
 assert(run,tostring(compileError))
 return run()
