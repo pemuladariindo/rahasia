@@ -1,11 +1,12 @@
 --[[
-DQR GILDED V21 - HARVARD / CROSS PREVIEW / WALL EXITS
+DQR GILDED V22 - HARVARD / KNIGHT KEEPOUT / MAGE MARGIN
 Run this complete file once. It saves its bundled engine in the executor's local
 workspace and runs it. No HTTP downloads or external code are used.
 
-NPC-only cross previews use the visible mage arm; unknown animation IDs are not guessed.
-Timed route intervals replace repeated hazard sampling to reduce planning cost.
-Terrain checks try diverse exits, wall tangents and safe progress before fallback.
+Ranged NPC keepout starts outside the known Knight circle before its marker appears.
+Mage predictions reserve additional time for network latency and frame delay.
+Cross previews, exact route intervals and terrain-diverse exits are retained.
+Dodge reports identify each life and include three recent death snapshots.
 The restored boss controller, V18 EIF fix and saved speed choice are retained.
 Harvard > Autofarm:
 - Mob dodge assist / Predict mage windups (ON by default)
@@ -29,7 +30,7 @@ local env = type(getgenv) == "function" and getgenv() or _G
 local payload = [=====[
 -- DQR_HARVARD_RUNTIME_V12
 --[[
-DQR HARVARD V21 RUNTIME
+DQR HARVARD V22 RUNTIME
 All 18 user-supplied reference components; Harvard menu only.
 Per-account save/load, autosave and teleport auto-execute are available in Autofarm.
 This local cached engine is installed by DQR_Gilded_V12_AutoExec.lua.
@@ -355,7 +356,7 @@ local function installHarvardPersistence(context)
 end
 
 -- NPC-only escape patterns. Boss frames always return to the original brain.
--- V21 uses exact route intervals and terrain-diverse exits near walls.
+-- V22 anticipates Knight approaches and budgets latency before mage impact.
 local function installMobReflex(context)
     local cfg, rt, rd = context.CFG, context.RT, context.RD
     local state = {active=false, mode="IDLE", zones={}, raw={}, lastRead=-math.huge,
@@ -368,6 +369,16 @@ local function installMobReflex(context)
     for _,key in ipairs(context.PERSIST or {}) do if key=="harvardMobDodge" then found=true end end
     if not found then table.insert(context.PERSIST,"harvardMobDodge") end
     local abs,min,max,sqrt = math.abs,math.min,math.max,math.sqrt
+    local function latency()
+        local function valid(value)
+            local n=tonumber(value)
+            return n and n==n and min(0.5,max(0,n)) or 0
+        end
+        return max(valid(rt.dataPingS),valid(rt.pingS))
+    end
+    local function reactionMargin()
+        return min(0.35,max(0.18,latency()+min(0.15,state.tickGap or 0)+0.08))
+    end
     local known = { ["gs swing"]=true,["gs kcircle"]=true,["gs beam"]=true,
         dracanimageattack=true,dracaniwarriorhitbox=true,dracaniknightcircle=true,
         dracanicfamiliarhitbox=true,dracanimagehitbox=true,northernmageshot=true,northernwarriorlinestrike=true,
@@ -510,6 +521,7 @@ local function installMobReflex(context)
     local function collect(now,origin)
         if now-state.lastRead<0.065 then return end
         state.lastRead=now; table.clear(state.zones)
+        state.reactionMargin=reactionMargin()
         state.sourceCount=0; state.acceptedCount=0; state.spaceCount=0
         if context.hazards then
             local zones=context.hazards(now,state.raw) or {}
@@ -582,7 +594,7 @@ local function installMobReflex(context)
                             predictionSource="visible mage arm",cx=zone.cx,cy=zone.cy,cz=zone.cz,
                             ax=-zone.az,az=zone.ax,bx=-zone.bz,bz=zone.bx,
                             ha=zone.ha+1,hb=zone.hb,hy=zone.hy,ground=zone.ground,
-                            from=spawned+hitAfter-min(0.12,tonumber(rt.pingS) or 0),
+                            from=spawned+hitAfter-reactionMargin(),
                             untilAt=min(zone.untilAt or math.huge,spawned+hitAfter+0.5),anticipate=now}
                         state.forecastCount+=1
                     end
@@ -593,7 +605,7 @@ local function installMobReflex(context)
                     local watch=mageWatch(e)
                     local hitAfter=tonumber(cfg.gsMageHitAfter) or 1.21
                     if watch and watch.at and now-watch.at<=hitAfter+0.5 then
-                        local from=watch.at+hitAfter-min(0.12,tonumber(rt.pingS) or 0)
+                        local from=watch.at+hitAfter-reactionMargin()
                         for _,sign in ipairs({-1,1}) do
                             local ax=(watch.dx-sign*watch.dz)*0.7071067811865476
                             local az=(watch.dz+sign*watch.dx)*0.7071067811865476
@@ -617,17 +629,22 @@ local function installMobReflex(context)
             for _,e in ipairs(rd.enemies or {}) do
                 if not e.isBoss and e.melee and alive(e) then
                     local pos=e.root.Position
-                    if abs(pos.Y-origin.Y)<10 and distance(origin,pos)<65 then
+                    local knight=string.lower(tostring(e.model and e.model.Name or "")):find("knight",1,true)~=nil
+                    if abs(pos.Y-origin.Y)<(knight and 16 or 10) and distance(origin,pos)<65 then
                         local radius=min(12,max(3,tonumber(e.meleeDistance) or 4))
                             +min(10,max(1,tonumber(e.extent) or 3))+1.5
+                        -- The recorded Knight circle has radius 18. Waiting
+                        -- for ordinary 4-stud melee range leaves a ranged
+                        -- character inside its approach/leap before a marker.
+                        if knight then radius=max(radius,22) end
                         local vx,vz=tonumber(e.vx) or 0,tonumber(e.vz) or 0
                         local v=sqrt(vx*vx+vz*vz)
-                        local zone={name="mob melee space",spacing=true,enemy=e,
-                            cx=pos.X,cy=pos.Y,cz=pos.Z,r=radius,hy=4,from=now,untilAt=math.huge}
+                        local zone={name=knight and "knight approach" or "mob melee space",spacing=true,enemy=e,
+                            cx=pos.X,cy=pos.Y,cz=pos.Z,r=radius,hy=knight and 10 or 4,from=now,untilAt=math.huge}
                         if v>0.1 then
                             zone.moving=true;zone.ox=pos.X;zone.oy=pos.Y;zone.oz=pos.Z
                             zone.dx=vx/v;zone.dz=vz/v;zone.speed=min(v,32)
-                            zone.pathStart=now;zone.endAlong=zone.speed*0.4
+                            zone.pathStart=now;zone.endAlong=zone.speed*(knight and min(0.75,0.55+latency()) or 0.4)
                         end
                         state.zones[#state.zones+1]=zone;state.spaceCount+=1
                     end
@@ -994,7 +1011,7 @@ local function installMobReflex(context)
         local speed=max(tonumber(hum.WalkSpeed) or 16,1)
         local height=hum.HipHeight+root.Size.Y*0.5
         local reach=max(root.Size.X,root.Size.Z)*0.5+1.3
-        local lead=min(0.65,0.25+(tonumber(rt.pingS) or 0)*1.5)
+        local lead=min(0.65,0.25+latency()*1.5)
         local current=risk(root.Position,now,0,reach,height,0.08)
         if current>0 then return false end -- active escapes belong to the pre-step planner
         local direction=move.Unit
@@ -1017,22 +1034,34 @@ local function installMobReflex(context)
         return false
     end
     function context.mobReflexTick(now)
+        state.tickGap=state.lastTick and max(0,min(0.5,now-state.lastTick)) or 0
+        state.lastTick=now
         if not cfg.harvardMobDodge then clearState("DISABLED"); return false end
         if not rt.farmEnabled or rt.destroyed or rt.modHalt then clearState("OFF"); return false end
         local char,hum,root=context.character()
-        if not root or not hum or hum.Health<=0 or hum.WalkSpeed<=0.1 or not context.mobReflexDrive then clearState(); return false end
+        if not root or not hum or hum.Health<=0 or hum.WalkSpeed<=0.1 or not context.mobReflexDrive then
+            if hum and hum.Health<=0 then state.wasDead=true end
+            clearState();return false
+        end
         local origin=root.Position
         if bossNear(origin) then clearState("BOSS"); return false end
         if not inGilded(now) then clearState("MAP NOT DETECTED"); return false end
         if context.pinnedBy and context.pinnedBy(char) then clearState("STUNNED"); return false end
+        if state.wasDead or state.characterRoot~=root or state.characterHum~=hum then
+            clearState()
+            state.wasDead=false
+            state.characterRoot=root;state.characterHum=hum;state.characterAt=now
+            state.lastRead=-math.huge;state.lastParts=-math.huge
+            state.failedGoal=nil;state.progressPos=nil;state.progressAt=nil
+        end
         collect(now,origin)
         local reach=max(root.Size.X,root.Size.Z)*0.5+1.3
         local height=hum.HipHeight+root.Size.Y*0.5
         local speed=max(tonumber(hum.WalkSpeed) or 16,1)
-        local lead=min(0.8,0.4+(tonumber(rt.pingS) or 0)*1.5)
+        local lead=min(0.8,0.4+latency()*1.5)
         for _,zone in ipairs(state.zones) do
             local inside=depth(zone,origin,now,height)+reach
-            if inside>0 then lead=min(1.4,max(lead,inside/speed+(tonumber(rt.pingS) or 0)+0.15)) end
+            if inside>0 then lead=min(1.4,max(lead,inside/speed+latency()+0.15)) end
         end
         local baseline,strongest=risk(origin,now,0,reach,height,lead)
         state.currentRisk=baseline
@@ -1090,7 +1119,7 @@ local function installMobReflex(context)
                 if root and hum and not bossNear(root.Position) then
                     local reach=max(root.Size.X,root.Size.Z)*0.5+1.3
                     local height=hum.HipHeight+root.Size.Y*0.5
-                    local window=min(1.2,max(0.35,tonumber(cfg.castRootTime) or 0.7)+(tonumber(rt.pingS) or 0))
+                    local window=min(1.2,max(0.35,tonumber(cfg.castRootTime) or 0.7)+latency())
                     for i=0,4 do
                         if risk(root.Position,now,window*i/4,reach,height,0.08,true)>0 then
                             state.castGate="attack footprint";return false,"mob dodge"
@@ -1109,7 +1138,7 @@ end
 -- Bounded local replay of movement decisions. No network requests or movement.
 local function installDodgeReports(context)
     local cfg,rt=context.CFG,context.RT
-    local report={frames={},status="V21: recording dodge decisions",lastSample=-math.huge,
+    local report={frames={},deaths={},life=0,status="V22: recording dodge decisions",lastSample=-math.huge,
         lastCaption=-math.huge,path="DQR_GildedV10/logs/dodge_last_death.json"}
     context.dodgeReports=report
     if cfg.harvardDodgeReports==nil then cfg.harvardDodgeReports=true end
@@ -1127,11 +1156,12 @@ local function installDodgeReports(context)
         if context.notify then pcall(context.notify,"info",title,text) end
     end
     local function build(reason,now)
-        local frames={}
+        local frames,deaths={},{}
         for i,frame in ipairs(report.frames) do frames[i]=frame end
-        return {version="V21",reason=reason,at=now,place_id=game.PlaceId,
+        for i,death in ipairs(report.deaths) do deaths[i]=death end
+        return {version="V22",reason=reason,at=now,place_id=game.PlaceId,
             class=cfg.classProfile,npc_assist=cfg.harvardMobDodge~=false,
-            speed21=cfg.harvardSpeed21~=false,frames=frames}
+            speed21=cfg.harvardSpeed21~=false,life=report.life,recent_deaths=deaths,frames=frames}
     end
     local function encode(data)
         local service=context.HttpService or game:GetService("HttpService")
@@ -1156,7 +1186,7 @@ local function installDodgeReports(context)
     end
     function context.harvardSaveDodgeReport()
         local ok,result=persist(latest())
-        report.status=ok and "V21: dodge report saved" or "V21: report save failed"
+        report.status=ok and "V22: dodge report saved" or "V22: report save failed"
         message("Dodge report",ok and ("Saved "..report.path) or tostring(result))
         return ok,result
     end
@@ -1175,7 +1205,7 @@ local function installDodgeReports(context)
         if now-report.lastCaption<0.5 then return end
         report.lastCaption=now
         local mob=context.mobDodge
-        local text=cfg.harvardDodgeReports==false and "V21: dodge recording OFF" or report.status
+        local text=cfg.harvardDodgeReports==false and "V22: dodge recording OFF" or report.status
         if mob then
             text=text.." | NPC: "..tostring(mob.mode).." | read/used "
                 ..tostring(mob.sourceCount or 0).."/"..tostring(mob.acceptedCount or 0)
@@ -1192,11 +1222,14 @@ local function installDodgeReports(context)
         end
         local _,hum,root=context.character()
         if not hum or not root then return end
-        local changedHum=report.hum~=hum
-        if changedHum then
-            report.hum=hum;report.lastHealth=nil
-        end
         local health=tonumber(hum.Health) or 0
+        local changedHum=report.hum~=hum
+        local revived=not changedHum and report.lastHealth and report.lastHealth<=0 and health>0
+        if changedHum or revived then
+            report.hum=hum;report.lastHealth=nil
+            report.life+=1;report.lifeAt=now;report.lastAlive=nil
+            report.lastSample=-math.huge
+        end
         local hurt=not changedHum and report.lastHealth and health<report.lastHealth
         local died=hurt and health<=0
         if now-report.lastSample<0.2 and not hurt then return end
@@ -1204,7 +1237,12 @@ local function installDodgeReports(context)
         local mob=context.mobDodge
         local rd=context.RD or {}
         local target=context.BR and context.BR.target
+        local humState
+        if hum.GetState then pcall(function() humState=tostring(hum:GetState()) end) end
         local frame={t=now,hp=finite(health),pos=vector(root.Position),
+            life=report.life,life_age=finite(now-(report.lifeAt or now)),
+            root_anchored=root.Anchored,hum_state=humState,platform_stand=hum.PlatformStand,
+            seated=hum.Sit,move_direction=vector(hum.MoveDirection),
             speed=finite(hum.WalkSpeed),velocity=vector(root.AssemblyLinearVelocity),
             farm=rt.farmEnabled,mode=mob and mob.mode,active=mob and mob.active,
             map_detected=mob and mob.mapReady,holding=mob and mob.holding,
@@ -1224,7 +1262,8 @@ local function installDodgeReports(context)
             current_risk=mob and finite(mob.currentRisk),predicted_risk=mob and finite(mob.predictedRisk),
             candidates=mob and mob.candidates,walls=mob and mob.blockedWalls,floor=mob and mob.blockedFloor,
             partial=mob and mob.partial,geometry_candidates=mob and mob.geometryCandidates,
-            zones={},predictions={},wall_hits={},enemies={}}
+            mage_margin=mob and finite(mob.reactionMargin),
+            zones={},predictions={},keepouts={},wall_hits={},enemies={}}
         for _,hit in ipairs(mob and mob.wallHits or {}) do
             if #frame.wall_hits>=8 then break end
             frame.wall_hits[#frame.wall_hits+1]={x=finite(hit.x),z=finite(hit.z),
@@ -1243,6 +1282,10 @@ local function installDodgeReports(context)
                 frame.predictions[#frame.predictions+1]={name=zone.name,x=zone.cx,z=zone.cz,
                     source=zone.predictionSource,ax=zone.ax,az=zone.az,ha=zone.ha,hb=zone.hb,
                     from=zone.from,until_at=zone.untilAt}
+            end
+            if zone.spacing and #frame.keepouts<8 then
+                frame.keepouts[#frame.keepouts+1]={name=zone.name,x=finite(zone.cx),z=finite(zone.cz),
+                    r=finite(zone.r),speed=finite(zone.speed),enemy=zone.enemy and zone.enemy.model and zone.enemy.model.Name}
             end
         end
         for _,enemy in ipairs(rd.enemies or {}) do
@@ -1264,11 +1307,15 @@ local function installDodgeReports(context)
         report.maxGap=0
         if #report.frames>80 then table.remove(report.frames,1) end
         report.lastHealth=health
+        if health>0 then report.lastAlive=frame end
         if died then
+            report.deaths[#report.deaths+1]={life=report.life,at=now,life_age=frame.life_age,
+                pos=frame.pos,last_alive=report.lastAlive,death=frame}
+            if #report.deaths>3 then table.remove(report.deaths,1) end
             report.lastDeath=build("death",now)
             local ok,result=persist(report.lastDeath)
-            report.status=ok and "V21: last death saved; Copy dodge report"
-                or "V21: last death buffered; Copy dodge report"
+            report.status=ok and "V22: last death saved; Copy dodge report"
+                or "V22: last death buffered; Copy dodge report"
             report.saveError=not ok and tostring(result) or nil
         end
     end
@@ -1276,7 +1323,7 @@ local function installDodgeReports(context)
     context.sliderConnections=context.sliderConnections or {}
     context.sliderConnections[#context.sliderConnections+1]=runService.Heartbeat:Connect(function()
         local ok,err=pcall(context.dodgeReportTick,os.clock())
-        if not ok then report.status="V21: report error";report.error=tostring(err) end
+        if not ok then report.status="V22: report error";report.error=tostring(err) end
     end)
 end
 
@@ -147357,7 +147404,7 @@ components.interfaceMainLoop = function(context)
         end, function(enabled)
             config.harvardMobDodge=enabled
             saveConfig()
-        end, 6, "Visible mage-cross previews, lighter route calculations and more escape directions near walls."))
+        end, 6, "Earlier Knight keepout, additional mage impact margin and per-life death diagnostics."))
         helper(uiLibrary.toggle(runsThisAccount, "Speed 21 (experimental)", function()
             return config.harvardSpeed21 ~= false
         end, function(enabled)
@@ -147381,7 +147428,7 @@ components.interfaceMainLoop = function(context)
             "Copy the last death's movement report, or the current report if there has been no death.")
         dodgeReportRow.add("Save dodge report", "secondary", function() context.harvardSaveDodgeReport() end,
             "Save the report as DQR_GildedV10/logs/dodge_last_death.json in the executor workspace.")
-        context.dodgeReports.caption=uiLibrary.label(runsThisAccount,"V21: recording dodge decisions","captionSub",10)
+        context.dodgeReports.caption=uiLibrary.label(runsThisAccount,"V22: recording dodge decisions","captionSub",10)
         context.dodgeReports.caption.Size=UDim2.new(1,0,0,38)
         context.dodgeReports.caption.TextWrapped=true
         local persistenceRow = uiLibrary.buttonRow(runsThisAccount, 3)
@@ -166070,7 +166117,7 @@ local ok, reason = xpcall(function()
     for index, name in ipairs(order) do
         if stopped then return end
         currentStage = name
-        print(("[DQR Harvard V21] Loading %d/18: %s"):format(index, name))
+        print(("[DQR Harvard V22] Loading %d/18: %s"):format(index, name))
         components[name](context)
         if name == "movementCombat" then
             installBossRecoveryMovement(context)
@@ -166087,7 +166134,7 @@ local ok, reason = xpcall(function()
         task.wait()
     end
     if stopped then return end
-    context.INTEGRATION_VERSION = "V21 Harvard cross preview and wall exits"
+    context.INTEGRATION_VERSION = "V22 Harvard Knight keepout and mage margin"
     context.harvardPersistence.refresh()
     pcall(context.saveConfig)
     local dungeon = context.Workspace:FindFirstChild("dungeonName")
@@ -166102,10 +166149,10 @@ local ok, reason = xpcall(function()
     if context.notify then
         context.notify("run", "Harvard ready", "Auto-start dungeon: " .. (context.CFG.autoStartDungeon ~= false and "ON" or "OFF") .. ". All controls are in this menu.")
     end
-    print("[DQR Harvard V21] Ready: Harvard menu only; auto-start " .. tostring(context.CFG.autoStartDungeon ~= false))
+    print("[DQR Harvard V22] Ready: Harvard menu only; auto-start " .. tostring(context.CFG.autoStartDungeon ~= false))
 end, function(err) return debug.traceback(tostring(err), 2) end)
 if not ok then
-    warn("[DQR Harvard V21] " .. currentStage .. ": " .. tostring(reason))
+    warn("[DQR Harvard V22] " .. currentStage .. ": " .. tostring(reason))
     stopHarvardEngine()
     pcall(function()
         getService("StarterGui"):SetCore("SendNotification", {
@@ -166128,8 +166175,8 @@ local cached, cacheError = pcall(function()
     assert(readfile(cachePath)==payload, "saved engine verification failed")
 end)
 env.DQRHarvardCacheReady = cached
-if not cached then warn("[DQR Harvard V21] Auto-execute cache unavailable: "..tostring(cacheError)) end
+if not cached then warn("[DQR Harvard V22] Auto-execute cache unavailable: "..tostring(cacheError)) end
 assert(type(loadstring)=="function", "Executor loadstring is required to run the bundled engine")
-local run, compileError = loadstring(payload,"@DQR_Harvard_V21")
+local run, compileError = loadstring(payload,"@DQR_Harvard_V22")
 assert(run,tostring(compileError))
 return run()
