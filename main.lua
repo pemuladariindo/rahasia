@@ -1,10 +1,11 @@
 --[[
-DQR GILDED V20 - HARVARD / MAGE WINDUPS / TIMED NPC ESCAPES
+DQR GILDED V21 - HARVARD / CROSS PREVIEW / WALL EXITS
 Run this complete file once. It saves its bundled engine in the executor's local
 workspace and runs it. No HTTP downloads or external code are used.
 
-NPC-only mage windup prediction and trajectory checks across attack activation times.
-Spacing retreats retain original damage-cast checks instead of blocking every cast.
+NPC-only cross previews use the visible mage arm; unknown animation IDs are not guessed.
+Timed route intervals replace repeated hazard sampling to reduce planning cost.
+Terrain checks try diverse exits, wall tangents and safe progress before fallback.
 The restored boss controller, V18 EIF fix and saved speed choice are retained.
 Harvard > Autofarm:
 - Mob dodge assist / Predict mage windups (ON by default)
@@ -28,7 +29,7 @@ local env = type(getgenv) == "function" and getgenv() or _G
 local payload = [=====[
 -- DQR_HARVARD_RUNTIME_V12
 --[[
-DQR HARVARD V20 RUNTIME
+DQR HARVARD V21 RUNTIME
 All 18 user-supplied reference components; Harvard menu only.
 Per-account save/load, autosave and teleport auto-execute are available in Autofarm.
 This local cached engine is installed by DQR_Gilded_V12_AutoExec.lua.
@@ -354,7 +355,7 @@ local function installHarvardPersistence(context)
 end
 
 -- NPC-only escape patterns. Boss frames always return to the original brain.
--- V20 checks the complete trajectory against attack activation/expiry times.
+-- V21 uses exact route intervals and terrain-diverse exits near walls.
 local function installMobReflex(context)
     local cfg, rt, rd = context.CFG, context.RT, context.RD
     local state = {active=false, mode="IDLE", zones={}, raw={}, lastRead=-math.huge,
@@ -415,7 +416,7 @@ local function installMobReflex(context)
     end
     local function clearState(mode)
         state.active=false; state.goal=nil; state.mode=mode or "IDLE"
-        state.holding=false
+        state.holding=false;state.partial=false
         rt.mobDodgeUntil=nil
     end
     local function ownedByMob(zone)
@@ -555,6 +556,38 @@ local function installMobReflex(context)
         end
         state.forecastCount=0
         if cfg.harvardMagePredict~=false then
+            -- DQR shows one long arm before the complete mage cross. Its
+            -- perpendicular arm shares the same center; no animation-ID guess
+            -- is needed. Only an observed, unpaired mage arm can seed this.
+            local physicalCount=#state.zones
+            for i=1,physicalCount do
+                local zone=state.zones[i]
+                if string.lower(tostring(zone.name))=="dracanimageattack"
+                    and zone.ha and zone.hb and zone.ax and zone.az
+                    and min(zone.ha,zone.hb)<=16 and max(zone.ha,zone.hb)>=50 then
+                    local paired=false
+                    for j=1,physicalCount do
+                        local other=state.zones[j]
+                        if j~=i and string.lower(tostring(other.name))=="dracanimageattack"
+                            and other.ax and other.az and other.ha and other.hb
+                            and (zone.cx-other.cx)^2+(zone.cz-other.cz)^2<9
+                            and abs(zone.ax*other.ax+zone.az*other.az)<0.2 then
+                            paired=true;break
+                        end
+                    end
+                    local spawned=zone.from or now
+                    local hitAfter=tonumber(cfg.gsMageHitAfter) or 1.21
+                    if not paired and now<spawned+hitAfter+0.35 then
+                        state.zones[#state.zones+1]={name="mage cross preview",forecast=true,
+                            predictionSource="visible mage arm",cx=zone.cx,cy=zone.cy,cz=zone.cz,
+                            ax=-zone.az,az=zone.ax,bx=-zone.bz,bz=zone.bx,
+                            ha=zone.ha+1,hb=zone.hb,hy=zone.hy,ground=zone.ground,
+                            from=spawned+hitAfter-min(0.12,tonumber(rt.pingS) or 0),
+                            untilAt=min(zone.untilAt or math.huge,spawned+hitAfter+0.5),anticipate=now}
+                        state.forecastCount+=1
+                    end
+                end
+            end
             for _,e in ipairs(rd.enemies or {}) do
                 if not e.isBoss and e.isMage and alive(e) and distance(origin,e.root.Position)<160 then
                     local watch=mageWatch(e)
@@ -565,6 +598,7 @@ local function installMobReflex(context)
                             local ax=(watch.dx-sign*watch.dz)*0.7071067811865476
                             local az=(watch.dz+sign*watch.dx)*0.7071067811865476
                             state.zones[#state.zones+1]={name="mage windup",forecast=true,enemy=e,
+                                predictionSource="recognized animation",
                                 cx=watch.cx,cy=watch.cy,cz=watch.cz,ax=ax,az=az,bx=-az,bz=ax,
                                 -- The recorded mage cross has half-width 6;
                                 -- allow additional room for target-lock delay.
@@ -626,8 +660,16 @@ local function installMobReflex(context)
     end
     local function clearRoute(origin,goal,root,params,feet)
         local size=Vector3.new(max(root.Size.X+0.6,2.5),max(root.Size.Y+1,3),max(root.Size.Z+0.6,2.5))
-        if context.Workspace:Blockcast(CFrame.new(origin),size,goal-origin,params) then
-            state.blockedWalls=(state.blockedWalls or 0)+1;return false
+        local hit=context.Workspace:Blockcast(CFrame.new(origin),size,goal-origin,params)
+        if hit then
+            state.blockedWalls=(state.blockedWalls or 0)+1
+            if state.wallHits and #state.wallHits<8 then
+                local normal=hit.Normal
+                state.wallHits[#state.wallHits+1]={x=goal.X,z=goal.Z,distance=hit.Distance,
+                    nx=normal and normal.X,nz=normal and normal.Z,
+                    part=hit.Instance and tostring(hit.Instance.Name or ""):sub(1,80)}
+            end
+            return false,hit
         end
         local steps=max(1,math.ceil(distance(origin,goal)/3))
         for i=1,steps do
@@ -697,44 +739,47 @@ local function installMobReflex(context)
         local length=distance(origin,goal)
         local eta=length/speed
         local horizon=max(eta,lead)+0.15
-        local function point(t)
-            return origin:Lerp(goal,length>0.001 and min(1,t/eta) or 0)
-        end
+        local dx,dz=goal.X-origin.X,goal.Z-origin.Z
         local missed,exposure,cross=0,0,0
         for _,zone in ipairs(state.zones) do
-            if not zone.spacing then
-                local start=max(0,(zone.from or now)-now)
-                local finish=min(horizon,(zone.untilAt or now+horizon)-now)
-                local cy=zone.oy or zone.cy
-                local vertical=not zone.ground and cy
-                    and abs(origin.Y-cy)>(zone.hy or zone.halfH or 3)+height
-                    and abs(goal.Y-cy)>(zone.hy or zone.halfH or 3)+height
-                if finish>start and not vertical then
-                    local cuts={start,finish}
-                    if eta>start and eta<finish then cuts[#cuts+1]=eta end
-                    if zone.moving and zone.endAlong and zone.pathStart and (zone.speed or 0)>0 then
-                        local stop=zone.pathStart-now+(zone.endAlong-(zone.offset or 0))/zone.speed
-                        if stop>start and stop<finish then cuts[#cuts+1]=stop end
-                    end
-                    table.sort(cuts)
-                    local hit=false
-                    for i=2,#cuts do
-                        local a,b=cuts[i-1],cuts[i]
-                        if b>a+1e-6 then
-                            local p,q=point(a),point(b)
-                            local cx,cz,ax,az,bx,bz,ha,hb=zoneFrame(zone,now+a)
-                            local ex,ez=zoneFrame(zone,now+b)
-                            if cx and cz and ex and ez then
-                                local lo,hi=interval(zone,p.X-cx,p.Z-cz,
-                                    (q.X-ex)-(p.X-cx),(q.Z-ez)-(p.Z-cz),reach,ax,az,bx,bz,ha,hb)
-                                if lo then hit=true;exposure+=(hi-lo)*(b-a) end
-                            end
+            local start=max(0,(zone.from or now)-now)
+            local finish=min(horizon,(zone.untilAt or now+horizon)-now)
+            local cy=zone.oy or zone.cy
+            local vertical=not zone.ground and cy
+                and abs(origin.Y-cy)>(zone.hy or zone.halfH or 3)+height
+                and abs(goal.Y-cy)>(zone.hy or zone.halfH or 3)+height
+            if finish>start and not vertical then
+                local motionStart=zone.moving and zone.pathStart and zone.pathStart-now
+                local motionStop=zone.moving and zone.endAlong and zone.pathStart and (zone.speed or 0)>0
+                    and zone.pathStart-now+(zone.endAlong-(zone.offset or 0))/zone.speed
+                local hit=false
+                local a=start
+                -- Split only at actual changes of velocity. No per-candidate
+                -- sample vectors, nested risk scans or temporary sorted arrays.
+                while a<finish-1e-6 do
+                    local b=finish
+                    if eta>a+1e-6 then b=min(b,eta) end
+                    if motionStart and motionStart>a+1e-6 then b=min(b,motionStart) end
+                    if motionStop and motionStop>a+1e-6 then b=min(b,motionStop) end
+                    local u=eta>0.0001 and min(1,a/eta) or 0
+                    local v=eta>0.0001 and min(1,b/eta) or 0
+                    local px,pz=origin.X+dx*u,origin.Z+dz*u
+                    local qx,qz=origin.X+dx*v,origin.Z+dz*v
+                    local cx,cz,ax,az,bx,bz,ha,hb=zoneFrame(zone,now+a)
+                    local ex,ez=zoneFrame(zone,now+b)
+                    if cx and cz and ex and ez then
+                        local lo,hi=interval(zone,px-cx,pz-cz,
+                            (qx-ex)-(px-cx),(qz-ez)-(pz-cz),reach,ax,az,bx,bz,ha,hb)
+                        if lo then
+                            hit=true
+                            exposure+=(hi-lo)*(b-a)*(zone.spacing and 0.2 or 1)
                         end
                     end
-                    if hit then
-                        if depth(zone,origin,now,height)+reach<=0 then cross+=1
-                        elseif start>0.001 then missed+=1 end
-                    end
+                    a=b
+                end
+                if hit then
+                    if depth(zone,origin,now,height)+reach<=0 then cross+=1
+                    elseif start>0.001 and not zone.spacing then missed+=1 end
                 end
             end
         end
@@ -745,29 +790,15 @@ local function installMobReflex(context)
         local length=distance(origin,goal)
         local eta=length/speed
         local endRisk=max((risk(goal,now,eta,reach,height,lead)),(risk(goal,now,lead,reach,height,0.1)))
-        local routeRisk,newCross=0,0
-        local steps=min(24,max(5,math.ceil(length/2)))
-        for i=1,steps do
-            local fraction=i/steps
-            local p=origin:Lerp(goal,fraction)
-            routeRisk+=risk(p,now,eta*fraction,reach,height,0.08)*5/steps
-            for _,zone in ipairs(state.zones) do
-                local at=now+eta*fraction
-                if at>=(zone.from or now)-0.08 and at<=(zone.untilAt or at+1)
-                    and depth(zone,origin,now,height)+reach<=0
-                    and depth(zone,p,at,height)+reach>0 then newCross+=1 end
-            end
-            routeRisk+=crowd(p,eta*fraction)*4/steps
-        end
+        local crowdScore=crowd(origin:Lerp(goal,0.5),eta*0.5)+crowd(goal,eta)
         local turn=0
         if state.goal then
             local a,b=goal-origin,state.goal-origin
             if a.Magnitude>0.1 and b.Magnitude>0.1 then turn=(1-a.Unit:Dot(b.Unit))*5 end
         end
         local missed,exposure,cross=routeTiming(origin,goal,now,speed,reach,height,lead)
-        newCross=max(newCross,cross)
-        return endRisk*160+routeRisk*24+newCross*100+eta*4+turn
-            +missed*1000000+exposure*800,endRisk,newCross,missed,exposure
+        return endRisk*160+crowdScore*48+cross*100+eta*4+turn
+            +missed*1000000+exposure*800,endRisk,cross,missed,exposure
     end
     state.routeScore=routeScore
     local function casterFor(zone,origin)
@@ -842,7 +873,8 @@ local function installMobReflex(context)
             end
         end
         local ranked={}
-        state.blockedWalls=0;state.blockedFloor=0;state.candidates=0
+        state.blockedWalls=0;state.blockedFloor=0;state.candidates=0;state.wallHits={}
+        state.geometryCandidates=#points
         local started=os.clock()
         for index,raw in ipairs(points) do
             if distance(origin,raw)>2 then
@@ -865,22 +897,84 @@ local function installMobReflex(context)
             if abs(a.score-b.score)>1e-6 then return a.score<b.score end
             return a.index<b.index
         end)
-        -- Rank with geometry/timing first; terrain casts are only needed for
-        -- the best candidates, rather than every sampled direction.
-        for i=1,min(#ranked,24) do
-            local candidate=ranked[i]
-            state.candidates+=1
-            local goal=floorAt(candidate.point,origin,feet,params)
-            if not goal then state.blockedFloor+=1
-            elseif clearRoute(origin,goal,root,params,feet) then
-                local score,endRisk,newCross,missed,exposure=routeScore(origin,goal,now,speed,reach,height,lead)
-                if newCross==0 and endRisk<baseline-0.05 and missed<=candidate.missed then
-                    state.deadlineMisses=missed;state.exposure=exposure;state.planWork=os.clock()-started
+        -- Checking only the best 24 scores can spend every probe on the same
+        -- blocked side of a circle. Reserve one probe per angular sector first.
+        local queue,selected,sectors={},{},{}
+        for _,candidate in ipairs(ranked) do
+            local d=candidate.point-origin
+            local sector=math.floor((math.atan2(d.Z,d.X)+math.pi)*8/math.pi)%16
+            if not sectors[sector] then
+                sectors[sector]=true;selected[candidate]=true;queue[#queue+1]=candidate
+            end
+        end
+        for _,candidate in ipairs(ranked) do
+            if not selected[candidate] then queue[#queue+1]=candidate end
+        end
+        local partial,partialScore,partialRisk,partialMissed,partialExposure
+        local slides,slideKeys={},{}
+        local clipped=0
+        local function assess(goal)
+            local score,endRisk,newCross,missed,exposure=routeScore(origin,goal,now,speed,reach,height,lead)
+            if newCross==0 and endRisk<baseline-0.05 then
+                if endRisk<=0.001 and missed==0 then
+                    state.deadlineMisses=missed;state.exposure=exposure;state.partial=false
                     return goal,endRisk
+                end
+                if not partial or score<partialScore then
+                    partial,partialScore,partialRisk=goal,score,endRisk
+                    partialMissed,partialExposure=missed,exposure
                 end
             end
         end
+        local function probe(point,canClip)
+            state.candidates+=1
+            local goal=floorAt(point,origin,feet,params)
+            if not goal then state.blockedFloor+=1
+            else
+                local clear,hit=clearRoute(origin,goal,root,params,feet)
+                if clear then return assess(goal) end
+                if canClip and hit then
+                    local normal=hit.Normal
+                    if normal and normal.X^2+normal.Z^2>0.25 then
+                        local n=Vector3.new(normal.X,0,normal.Z).Unit
+                        local tangent=Vector3.new(-n.Z,0,n.X)
+                        for _,sign in ipairs({1,-1}) do
+                            local key=math.floor((math.atan2(tangent.Z*sign,tangent.X*sign)+math.pi)*8/math.pi)%16
+                            if not slideKeys[key] then
+                                slideKeys[key]=true
+                                slides[#slides+1]=origin+tangent*(sign*16)+n
+                            end
+                        end
+                    end
+                    local length=distance(origin,goal)
+                    local available=tonumber(hit.Distance)
+                    if available and available>4 and clipped<8 then
+                        local fraction=min(1,(available-1)/max(length,0.001))
+                        local short=floorAt(origin:Lerp(goal,fraction),origin,feet,params)
+                        clipped+=1
+                        if short and distance(origin,short)>3 and clearRoute(origin,short,root,params,feet) then
+                            local safe,value=assess(short)
+                            if safe then return safe,value end
+                        end
+                    end
+                end
+            end
+        end
+        for i=1,min(#queue,24) do
+            local goal,value=probe(queue[i].point,true)
+            if goal then state.planWork=os.clock()-started;return goal,value end
+        end
+        -- A wall tangent may lie between the sampled angles. It is subjected
+        -- to exactly the same floor, timing and new-crossing checks.
+        for i=1,min(#slides,8) do
+            local goal,value=probe(slides[i],false)
+            if goal then state.planWork=os.clock()-started;return goal,value end
+        end
         state.planWork=os.clock()-started
+        if partial then
+            state.partial=true;state.deadlineMisses=partialMissed;state.exposure=partialExposure
+            return partial,partialRisk
+        end
         return nil,math.huge
     end
     function context.mobReflexPost(now)
@@ -969,7 +1063,8 @@ local function installMobReflex(context)
             end
         end
         state.routeBlocked=blocked;state.stuck=stuck
-        local replan=not state.goal or goalRisk>0.05 or newCross>0 or missed>0 or reached or blocked or stuck
+        local unsafeGoal=goalRisk>0.05 and not (state.partial and now-state.lastPlan<0.12)
+        local replan=not state.goal or unsafeGoal or newCross>0 or missed>0 or reached or blocked or stuck
         if replan and (not state.goal or goalRisk>0.05 or newCross>0 or missed>0 or blocked or stuck or now-state.lastPlan>=0.075) then
             state.lastPlan=now
             local goal,newRisk=choose(origin,root,hum,now,reach,height,lead,strongest,max(baseline,0.1))
@@ -1014,7 +1109,7 @@ end
 -- Bounded local replay of movement decisions. No network requests or movement.
 local function installDodgeReports(context)
     local cfg,rt=context.CFG,context.RT
-    local report={frames={},status="V20: recording dodge decisions",lastSample=-math.huge,
+    local report={frames={},status="V21: recording dodge decisions",lastSample=-math.huge,
         lastCaption=-math.huge,path="DQR_GildedV10/logs/dodge_last_death.json"}
     context.dodgeReports=report
     if cfg.harvardDodgeReports==nil then cfg.harvardDodgeReports=true end
@@ -1034,7 +1129,7 @@ local function installDodgeReports(context)
     local function build(reason,now)
         local frames={}
         for i,frame in ipairs(report.frames) do frames[i]=frame end
-        return {version="V20",reason=reason,at=now,place_id=game.PlaceId,
+        return {version="V21",reason=reason,at=now,place_id=game.PlaceId,
             class=cfg.classProfile,npc_assist=cfg.harvardMobDodge~=false,
             speed21=cfg.harvardSpeed21~=false,frames=frames}
     end
@@ -1061,7 +1156,7 @@ local function installDodgeReports(context)
     end
     function context.harvardSaveDodgeReport()
         local ok,result=persist(latest())
-        report.status=ok and "V20: dodge report saved" or "V20: report save failed"
+        report.status=ok and "V21: dodge report saved" or "V21: report save failed"
         message("Dodge report",ok and ("Saved "..report.path) or tostring(result))
         return ok,result
     end
@@ -1080,7 +1175,7 @@ local function installDodgeReports(context)
         if now-report.lastCaption<0.5 then return end
         report.lastCaption=now
         local mob=context.mobDodge
-        local text=cfg.harvardDodgeReports==false and "V20: dodge recording OFF" or report.status
+        local text=cfg.harvardDodgeReports==false and "V21: dodge recording OFF" or report.status
         if mob then
             text=text.." | NPC: "..tostring(mob.mode).." | read/used "
                 ..tostring(mob.sourceCount or 0).."/"..tostring(mob.acceptedCount or 0)
@@ -1128,7 +1223,13 @@ local function installDodgeReports(context)
             root_size=vector(root.Size),hip_height=finite(hum.HipHeight),
             current_risk=mob and finite(mob.currentRisk),predicted_risk=mob and finite(mob.predictedRisk),
             candidates=mob and mob.candidates,walls=mob and mob.blockedWalls,floor=mob and mob.blockedFloor,
-            zones={},predictions={},enemies={}}
+            partial=mob and mob.partial,geometry_candidates=mob and mob.geometryCandidates,
+            zones={},predictions={},wall_hits={},enemies={}}
+        for _,hit in ipairs(mob and mob.wallHits or {}) do
+            if #frame.wall_hits>=8 then break end
+            frame.wall_hits[#frame.wall_hits+1]={x=finite(hit.x),z=finite(hit.z),
+                distance=finite(hit.distance),nx=finite(hit.nx),nz=finite(hit.nz),part=hit.part}
+        end
         for _,zone in ipairs(mob and mob.raw or {}) do
             if #frame.zones>=8 then break end
             frame.zones[#frame.zones+1]={name=tostring(zone.name),x=finite(zone.cx or zone.ox),
@@ -1140,7 +1241,8 @@ local function installDodgeReports(context)
         for _,zone in ipairs(mob and mob.zones or {}) do
             if zone.forecast and #frame.predictions<8 then
                 frame.predictions[#frame.predictions+1]={name=zone.name,x=zone.cx,z=zone.cz,
-                    ax=zone.ax,az=zone.az,ha=zone.ha,hb=zone.hb,from=zone.from,until_at=zone.untilAt}
+                    source=zone.predictionSource,ax=zone.ax,az=zone.az,ha=zone.ha,hb=zone.hb,
+                    from=zone.from,until_at=zone.untilAt}
             end
         end
         for _,enemy in ipairs(rd.enemies or {}) do
@@ -1165,8 +1267,8 @@ local function installDodgeReports(context)
         if died then
             report.lastDeath=build("death",now)
             local ok,result=persist(report.lastDeath)
-            report.status=ok and "V20: last death saved; Copy dodge report"
-                or "V20: last death buffered; Copy dodge report"
+            report.status=ok and "V21: last death saved; Copy dodge report"
+                or "V21: last death buffered; Copy dodge report"
             report.saveError=not ok and tostring(result) or nil
         end
     end
@@ -1174,7 +1276,7 @@ local function installDodgeReports(context)
     context.sliderConnections=context.sliderConnections or {}
     context.sliderConnections[#context.sliderConnections+1]=runService.Heartbeat:Connect(function()
         local ok,err=pcall(context.dodgeReportTick,os.clock())
-        if not ok then report.status="V20: report error";report.error=tostring(err) end
+        if not ok then report.status="V21: report error";report.error=tostring(err) end
     end)
 end
 
@@ -147255,7 +147357,7 @@ components.interfaceMainLoop = function(context)
         end, function(enabled)
             config.harvardMobDodge=enabled
             saveConfig()
-        end, 6, "Mage windup prediction, attack-timed escape routes and safe spacing. Original boss controller retained."))
+        end, 6, "Visible mage-cross previews, lighter route calculations and more escape directions near walls."))
         helper(uiLibrary.toggle(runsThisAccount, "Speed 21 (experimental)", function()
             return config.harvardSpeed21 ~= false
         end, function(enabled)
@@ -147273,13 +147375,13 @@ components.interfaceMainLoop = function(context)
         end,function(enabled)
             config.harvardMagePredict=enabled
             saveConfig()
-        end,11,"Move before the Dracani Mage cross appears, using its known cast animation. Unknown animations are only recorded."))
+        end,11,"Anticipate the full mage cross from its visible first arm or a recognized cast animation. Unknown animations are only recorded."))
         local dodgeReportRow=uiLibrary.buttonRow(runsThisAccount, 9)
         dodgeReportRow.add("Copy dodge report", "secondary", function() context.harvardCopyDodgeReport() end,
             "Copy the last death's movement report, or the current report if there has been no death.")
         dodgeReportRow.add("Save dodge report", "secondary", function() context.harvardSaveDodgeReport() end,
             "Save the report as DQR_GildedV10/logs/dodge_last_death.json in the executor workspace.")
-        context.dodgeReports.caption=uiLibrary.label(runsThisAccount,"V20: recording dodge decisions","captionSub",10)
+        context.dodgeReports.caption=uiLibrary.label(runsThisAccount,"V21: recording dodge decisions","captionSub",10)
         context.dodgeReports.caption.Size=UDim2.new(1,0,0,38)
         context.dodgeReports.caption.TextWrapped=true
         local persistenceRow = uiLibrary.buttonRow(runsThisAccount, 3)
@@ -165968,7 +166070,7 @@ local ok, reason = xpcall(function()
     for index, name in ipairs(order) do
         if stopped then return end
         currentStage = name
-        print(("[DQR Harvard V20] Loading %d/18: %s"):format(index, name))
+        print(("[DQR Harvard V21] Loading %d/18: %s"):format(index, name))
         components[name](context)
         if name == "movementCombat" then
             installBossRecoveryMovement(context)
@@ -165985,7 +166087,7 @@ local ok, reason = xpcall(function()
         task.wait()
     end
     if stopped then return end
-    context.INTEGRATION_VERSION = "V20 Harvard mage windup and route timing"
+    context.INTEGRATION_VERSION = "V21 Harvard cross preview and wall exits"
     context.harvardPersistence.refresh()
     pcall(context.saveConfig)
     local dungeon = context.Workspace:FindFirstChild("dungeonName")
@@ -166000,10 +166102,10 @@ local ok, reason = xpcall(function()
     if context.notify then
         context.notify("run", "Harvard ready", "Auto-start dungeon: " .. (context.CFG.autoStartDungeon ~= false and "ON" or "OFF") .. ". All controls are in this menu.")
     end
-    print("[DQR Harvard V20] Ready: Harvard menu only; auto-start " .. tostring(context.CFG.autoStartDungeon ~= false))
+    print("[DQR Harvard V21] Ready: Harvard menu only; auto-start " .. tostring(context.CFG.autoStartDungeon ~= false))
 end, function(err) return debug.traceback(tostring(err), 2) end)
 if not ok then
-    warn("[DQR Harvard V20] " .. currentStage .. ": " .. tostring(reason))
+    warn("[DQR Harvard V21] " .. currentStage .. ": " .. tostring(reason))
     stopHarvardEngine()
     pcall(function()
         getService("StarterGui"):SetCore("SendNotification", {
@@ -166026,8 +166128,8 @@ local cached, cacheError = pcall(function()
     assert(readfile(cachePath)==payload, "saved engine verification failed")
 end)
 env.DQRHarvardCacheReady = cached
-if not cached then warn("[DQR Harvard V20] Auto-execute cache unavailable: "..tostring(cacheError)) end
+if not cached then warn("[DQR Harvard V21] Auto-execute cache unavailable: "..tostring(cacheError)) end
 assert(type(loadstring)=="function", "Executor loadstring is required to run the bundled engine")
-local run, compileError = loadstring(payload,"@DQR_Harvard_V20")
+local run, compileError = loadstring(payload,"@DQR_Harvard_V21")
 assert(run,tostring(compileError))
 return run()
