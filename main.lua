@@ -1,11 +1,12 @@
 --[[
-DQR GILDED V22_1 - HARVARD / SPACING ROLLBACK
+DQR GILDED V23 - HARVARD / BUFFERED ATTACK EXITS
 Run this complete file once. It saves its bundled engine in the executor's local
 workspace and runs it. No HTTP downloads or external code are used.
 
-Restores V21 NPC proximity spacing after reproducing a V22 beam-escape regression.
-Actual Knight circle markers still use their full observed footprint.
-Mage timing margin, character-route reset and per-life death reports are retained.
+NPC escapes reserve movement clearance for measured network and frame delay.
+Observed attack exits take priority over speculative melee proximity bands.
+Shortened wall routes are compared with other complete exits before committing.
+Reports count each death once and retain recent replay frames for each life.
 Harvard > Autofarm:
 - Mob dodge assist / Predict mage windups (ON by default)
 - Record dodge reports / Copy dodge report / Save dodge report
@@ -28,7 +29,7 @@ local env = type(getgenv) == "function" and getgenv() or _G
 local payload = [=====[
 -- DQR_HARVARD_RUNTIME_V12
 --[[
-DQR HARVARD V22.1 RUNTIME
+DQR HARVARD V23 RUNTIME
 All 18 user-supplied reference components; Harvard menu only.
 Per-account save/load, autosave and teleport auto-execute are available in Autofarm.
 This local cached engine is installed by DQR_Gilded_V12_AutoExec.lua.
@@ -354,7 +355,7 @@ local function installHarvardPersistence(context)
 end
 
 -- NPC-only escape patterns. Boss frames always return to the original brain.
--- V22.1 restores V21 proximity spacing; keeps timing margin and lifecycle fixes.
+-- V23 retains clearance at handoff and prioritizes observed attack exits.
 local function installMobReflex(context)
     local cfg, rt, rd = context.CFG, context.RT, context.RD
     local state = {active=false, mode="IDLE", zones={}, raw={}, lastRead=-math.huge,
@@ -376,6 +377,13 @@ local function installMobReflex(context)
     end
     local function reactionMargin()
         return min(0.35,max(0.18,latency()+min(0.15,state.tickGap or 0)+0.08))
+    end
+    local function playerReach(root,hum)
+        local body=max(root.Size.X,root.Size.Z)*0.5+1.3
+        local speed=max(tonumber(hum.WalkSpeed) or 16,1)
+        local margin=min(3.5,max(1.25,speed*(latency()+min(0.1,state.tickGap or 0))))
+        state.bodyReach=body;state.motionAllowance=margin;state.effectiveReach=body+margin
+        return body+margin
     end
     local known = { ["gs swing"]=true,["gs kcircle"]=true,["gs beam"]=true,
         dracanimageattack=true,dracaniwarriorhitbox=true,dracaniknightcircle=true,
@@ -426,6 +434,7 @@ local function installMobReflex(context)
     local function clearState(mode)
         state.active=false; state.goal=nil; state.mode=mode or "IDLE"
         state.holding=false;state.partial=false
+        state.finishing=false;state.priorityPhysical=false
         rt.mobDodgeUntil=nil
     end
     local function ownedByMob(zone)
@@ -458,6 +467,11 @@ local function installMobReflex(context)
         return -sqrt(max(da,0)^2+max(db,0)^2)
     end
     state.depth=depth
+    local function zoneReach(zone,reach)
+        -- Forecast arms already include uncertainty in their own width.
+        -- Do not expand them a second time with the observed-hitbox margin.
+        return zone.forecast and state.bodyReach and min(reach,state.bodyReach) or reach
+    end
 
     local function isMarker(part)
         if not part:IsA("BasePart") or part.CanCollide or part.Transparency>=0.95 then return false end
@@ -648,14 +662,15 @@ local function installMobReflex(context)
             end
         end
     end
-    local function risk(p,now,delta,reach,height,lead,ignoreSpacing)
+    local function risk(p,now,delta,reach,height,lead,ignoreSpacing,ignoreForecast)
         local total,strongest,strongestValue=0,nil,0
         for _,zone in ipairs(state.zones) do
             local at=now+delta
             if not (ignoreSpacing and zone.spacing)
+                and not (ignoreForecast and zone.forecast)
                 and at<=(zone.untilAt or at+1)
                 and (zone.anticipate and at>=zone.anticipate or at>=(zone.from or now)-lead) then
-                local d=depth(zone,p,at,height)+reach
+                local d=depth(zone,p,at,height)+zoneReach(zone,reach)
                 if d>0 then
                     local value=1+min(d,30)/30
                     total+=value
@@ -753,8 +768,9 @@ local function installMobReflex(context)
         local eta=length/speed
         local horizon=max(eta,lead)+0.15
         local dx,dz=goal.X-origin.X,goal.Z-origin.Z
-        local missed,exposure,cross=0,0,0
+        local missed,exposure,cross,attackExposure=0,0,0,0
         for _,zone in ipairs(state.zones) do
+            local envelope=zoneReach(zone,reach)
             local start=max(0,(zone.from or now)-now)
             local finish=min(horizon,(zone.untilAt or now+horizon)-now)
             local cy=zone.oy or zone.cy
@@ -782,36 +798,40 @@ local function installMobReflex(context)
                     local ex,ez=zoneFrame(zone,now+b)
                     if cx and cz and ex and ez then
                         local lo,hi=interval(zone,px-cx,pz-cz,
-                            (qx-ex)-(px-cx),(qz-ez)-(pz-cz),reach,ax,az,bx,bz,ha,hb)
+                            (qx-ex)-(px-cx),(qz-ez)-(pz-cz),envelope,ax,az,bx,bz,ha,hb)
                         if lo then
                             hit=true
-                            exposure+=(hi-lo)*(b-a)*(zone.spacing and 0.2 or 1)
+                            local duration=(hi-lo)*(b-a)
+                            exposure+=duration*(zone.spacing and 0.2 or 1)
+                            if not zone.spacing and not zone.forecast then attackExposure+=duration end
                         end
                     end
                     a=b
                 end
                 if hit then
-                    if depth(zone,origin,now,height)+reach<=0 then cross+=1
+                    if depth(zone,origin,now,height)+envelope<=0 then
+                        if not (zone.spacing and state.priorityPhysical) then cross+=1 end
                     elseif start>0.001 and not zone.spacing then missed+=1 end
                 end
             end
         end
-        return missed,exposure,cross
+        return missed,exposure,cross,attackExposure
     end
     state.routeTiming=routeTiming
     local function routeScore(origin,goal,now,speed,reach,height,lead)
         local length=distance(origin,goal)
         local eta=length/speed
-        local endRisk=max((risk(goal,now,eta,reach,height,lead)),(risk(goal,now,lead,reach,height,0.1)))
+        local endRisk=max((risk(goal,now,eta,reach,height,lead,state.priorityPhysical)),
+            (risk(goal,now,lead,reach,height,0.1,state.priorityPhysical)))
         local crowdScore=crowd(origin:Lerp(goal,0.5),eta*0.5)+crowd(goal,eta)
         local turn=0
         if state.goal then
             local a,b=goal-origin,state.goal-origin
             if a.Magnitude>0.1 and b.Magnitude>0.1 then turn=(1-a.Unit:Dot(b.Unit))*5 end
         end
-        local missed,exposure,cross=routeTiming(origin,goal,now,speed,reach,height,lead)
+        local missed,exposure,cross,attackExposure=routeTiming(origin,goal,now,speed,reach,height,lead)
         return endRisk*160+crowdScore*48+cross*100+eta*4+turn
-            +missed*1000000+exposure*800,endRisk,cross,missed,exposure
+            +missed*1000000+exposure*800,endRisk,cross,missed,exposure,attackExposure
     end
     state.routeScore=routeScore
     local function casterFor(zone,origin)
@@ -888,25 +908,34 @@ local function installMobReflex(context)
         local ranked={}
         state.blockedWalls=0;state.blockedFloor=0;state.candidates=0;state.wallHits={}
         state.geometryCandidates=#points
+        state.planOrigin=origin;state.planAt=now
         local started=os.clock()
+        local function preference(score,raw)
+            if melee and caster then
+                score+=max(0,distance(origin,caster.root.Position)-distance(raw,caster.root.Position))*5
+            end
+            if state.failedGoal and now-(state.failedAt or 0)<1 then
+                local a,b=raw-origin,state.failedGoal-origin
+                if a.Magnitude>0.1 and b.Magnitude>0.1 and a.Unit:Dot(b.Unit)>0.8 then score+=2000 end
+            end
+            return score
+        end
         for index,raw in ipairs(points) do
             if distance(origin,raw)>2 then
-                local score,endRisk,newCross,missed,exposure=routeScore(origin,raw,now,speed,reach,height,lead)
-                if melee and caster then
-                    score+=max(0,distance(origin,caster.root.Position)-distance(raw,caster.root.Position))*5
-                end
-                if state.failedGoal and now-(state.failedAt or 0)<1 then
-                    local a,b=raw-origin,state.failedGoal-origin
-                    if a.Magnitude>0.1 and b.Magnitude>0.1 and a.Unit:Dot(b.Unit)>0.8 then score+=2000 end
-                end
+                local score,endRisk,newCross,missed,exposure,attackExposure=routeScore(origin,raw,now,speed,reach,height,lead)
+                score=preference(score,raw)
                 if newCross==0 and endRisk<baseline-0.05 then
                     ranked[#ranked+1]={point=raw,score=score,risk=endRisk,missed=missed,
-                        exposure=exposure,index=index,rank=missed>0 and 2 or endRisk<=0.001 and 0 or 1}
+                        exposure=exposure,attackExposure=attackExposure,attackRank=math.floor(attackExposure*1000+0.5),index=index,
+                        rank=missed>0 and 2 or endRisk<=0.001 and 0 or 1}
                 end
             end
         end
         table.sort(ranked,function(a,b)
             if a.rank~=b.rank then return a.rank<b.rank end
+            if state.priorityPhysical and a.attackRank~=b.attackRank then
+                return a.attackRank<b.attackRank
+            end
             if abs(a.score-b.score)>1e-6 then return a.score<b.score end
             return a.index<b.index
         end)
@@ -923,19 +952,27 @@ local function installMobReflex(context)
         for _,candidate in ipairs(ranked) do
             if not selected[candidate] then queue[#queue+1]=candidate end
         end
-        local partial,partialScore,partialRisk,partialMissed,partialExposure
+        local partial,partialScore,partialRisk,partialMissed,partialExposure,partialAttackExposure
+        local bestSafe
         local slides,slideKeys={},{}
         local clipped=0
-        local function assess(goal)
-            local score,endRisk,newCross,missed,exposure=routeScore(origin,goal,now,speed,reach,height,lead)
+        local function assess(goal,clippedGoal)
+            local score,endRisk,newCross,missed,exposure,attackExposure=routeScore(origin,goal,now,speed,reach,height,lead)
+            score=preference(score,goal)
+            local attackRank=math.floor(attackExposure*1000+0.5)
             if newCross==0 and endRisk<baseline-0.05 then
                 if endRisk<=0.001 and missed==0 then
-                    state.deadlineMisses=missed;state.exposure=exposure;state.partial=false
+                    if not bestSafe or state.priorityPhysical and attackRank<bestSafe.attackRank
+                        or (not state.priorityPhysical or attackRank==bestSafe.attackRank) and score<bestSafe.score then
+                        bestSafe={goal=goal,risk=endRisk,score=score,missed=missed,exposure=exposure,
+                            attackExposure=attackExposure,attackRank=attackRank,exact=not clippedGoal}
+                    end
                     return goal,endRisk
                 end
                 if not partial or score<partialScore then
                     partial,partialScore,partialRisk=goal,score,endRisk
                     partialMissed,partialExposure=missed,exposure
+                    partialAttackExposure=attackExposure
                 end
             end
         end
@@ -966,26 +1003,37 @@ local function installMobReflex(context)
                         local short=floorAt(origin:Lerp(goal,fraction),origin,feet,params)
                         clipped+=1
                         if short and distance(origin,short)>3 and clearRoute(origin,short,root,params,feet) then
-                            local safe,value=assess(short)
+                            local safe,value=assess(short,true)
                             if safe then return safe,value end
                         end
                     end
                 end
             end
         end
+        local function finishSafe()
+            state.deadlineMisses=bestSafe.missed;state.exposure=bestSafe.exposure;state.partial=false
+            state.attackExposure=bestSafe.attackExposure
+            state.planWork=os.clock()-started
+            return bestSafe.goal,bestSafe.risk
+        end
         for i=1,min(#queue,24) do
-            local goal,value=probe(queue[i].point,true)
-            if goal then state.planWork=os.clock()-started;return goal,value end
+            probe(queue[i].point,true)
+            -- A shortened or alternate-direction path must be rescored against
+            -- the other exits. Only an already optimal route can return early.
+            if bestSafe and bestSafe.exact and ranked[1]
+                and (not state.priorityPhysical or bestSafe.attackRank<=ranked[1].attackRank)
+                and bestSafe.score<=ranked[1].score+0.00001 then return finishSafe() end
         end
         -- A wall tangent may lie between the sampled angles. It is subjected
         -- to exactly the same floor, timing and new-crossing checks.
         for i=1,min(#slides,8) do
-            local goal,value=probe(slides[i],false)
-            if goal then state.planWork=os.clock()-started;return goal,value end
+            probe(slides[i],false)
         end
+        if bestSafe then return finishSafe() end
         state.planWork=os.clock()-started
         if partial then
             state.partial=true;state.deadlineMisses=partialMissed;state.exposure=partialExposure
+            state.attackExposure=partialAttackExposure
             return partial,partialRisk
         end
         return nil,math.huge
@@ -1006,7 +1054,7 @@ local function installMobReflex(context)
         collect(now,root.Position)
         local speed=max(tonumber(hum.WalkSpeed) or 16,1)
         local height=hum.HipHeight+root.Size.Y*0.5
-        local reach=max(root.Size.X,root.Size.Z)*0.5+1.3
+        local reach=playerReach(root,hum)
         local lead=min(0.65,0.25+latency()*1.5)
         local current=risk(root.Position,now,0,reach,height,0.08)
         if current>0 then return false end -- active escapes belong to the pre-step planner
@@ -1051,7 +1099,7 @@ local function installMobReflex(context)
             state.failedGoal=nil;state.progressPos=nil;state.progressAt=nil
         end
         collect(now,origin)
-        local reach=max(root.Size.X,root.Size.Z)*0.5+1.3
+        local reach=playerReach(root,hum)
         local height=hum.HipHeight+root.Size.Y*0.5
         local speed=max(tonumber(hum.WalkSpeed) or 16,1)
         local lead=min(0.8,0.4+latency()*1.5)
@@ -1059,19 +1107,31 @@ local function installMobReflex(context)
             local inside=depth(zone,origin,now,height)+reach
             if inside>0 then lead=min(1.4,max(lead,inside/speed+latency()+0.15)) end
         end
-        local baseline,strongest=risk(origin,now,0,reach,height,lead)
-        state.currentRisk=baseline
         local velocity=root.AssemblyLinearVelocity or Vector3.zero
         local flat=Vector3.new(velocity.X,0,velocity.Z)
         if flat.Magnitude>speed then flat=flat.Unit*speed end
-        local ahead,aheadZone=risk(origin+flat*lead,now,lead,reach,height,0.12)
+        local physical,physicalZone=risk(origin,now,0,reach,height,lead,true,true)
+        local physicalAhead=risk(origin+flat*lead,now,lead,reach,height,0.12,true,true)
+        state.finishing=false
+        if state.active and physical<=0 then
+            local buffer,zone=risk(origin,now,0,reach+1,height,lead,true,true)
+            if buffer>0 then
+                reach+=1;physical,physicalZone=buffer,zone;state.finishing=true
+            end
+        end
+        state.priorityPhysical=physical>0 or physicalAhead>0
+        local baseline,strongest=risk(origin,now,0,reach,height,lead,state.priorityPhysical)
+        state.currentRisk=baseline
+        state.spacingRisk=risk(origin,now,0,reach,height,lead)-physical
+        local ahead,aheadZone=risk(origin+flat*lead,now,lead,reach,height,0.12,state.priorityPhysical)
         if ahead>baseline then baseline,strongest=ahead,aheadZone end
         state.predictedRisk=baseline
         local reached=state.goal and distance(origin,state.goal)<2.5
         if baseline<=0 then
             if not state.active or reached or now>(state.holdUntil or 0) then clearState(); return false end
         end
-        local goalRisk=state.goal and max((risk(state.goal,now,distance(origin,state.goal)/speed,reach,height,lead)),(risk(state.goal,now,lead,reach,height,0.1))) or math.huge
+        local goalRisk=state.goal and max((risk(state.goal,now,distance(origin,state.goal)/speed,reach,height,lead,state.priorityPhysical)),
+            (risk(state.goal,now,lead,reach,height,0.1,state.priorityPhysical))) or math.huge
         local newCross,missed=0,0
         local blocked,stuck=false,false
         if state.goal then
@@ -1089,12 +1149,14 @@ local function installMobReflex(context)
         end
         state.routeBlocked=blocked;state.stuck=stuck
         local unsafeGoal=goalRisk>0.05 and not (state.partial and now-state.lastPlan<0.12)
-        local replan=not state.goal or unsafeGoal or newCross>0 or missed>0 or reached or blocked or stuck
-        if replan and (not state.goal or goalRisk>0.05 or newCross>0 or missed>0 or blocked or stuck or now-state.lastPlan>=0.075) then
+        local priorityChanged=state.goal and state.priorityPhysical and not state.goalPhysical
+        local replan=not state.goal or unsafeGoal or newCross>0 or missed>0 or reached or blocked or stuck or priorityChanged
+        if replan and (not state.goal or goalRisk>0.05 or newCross>0 or missed>0 or blocked or stuck or priorityChanged or now-state.lastPlan>=0.075) then
             state.lastPlan=now
             local goal,newRisk=choose(origin,root,hum,now,reach,height,lead,strongest,max(baseline,0.1))
             if not goal then clearState("LEGACY FALLBACK"); return false end
             state.goal=goal; goalRisk=newRisk; state.holdUntil=now+0.3; state.plans+=1
+            state.goalPhysical=state.priorityPhysical
             state.checkedAt=now;state.progressAt=now;state.progressPos=origin
         end
         if not state.goal then clearState(); return false end
@@ -1113,7 +1175,7 @@ local function installMobReflex(context)
             if state.active and (rt.mobDodgeUntil or 0)>now then
                 local _,hum,root=context.character()
                 if root and hum and not bossNear(root.Position) then
-                    local reach=max(root.Size.X,root.Size.Z)*0.5+1.3
+                    local reach=playerReach(root,hum)
                     local height=hum.HipHeight+root.Size.Y*0.5
                     local window=min(1.2,max(0.35,tonumber(cfg.castRootTime) or 0.7)+latency())
                     for i=0,4 do
@@ -1134,7 +1196,7 @@ end
 -- Bounded local replay of movement decisions. No network requests or movement.
 local function installDodgeReports(context)
     local cfg,rt=context.CFG,context.RT
-    local report={frames={},deaths={},life=0,status="V22.1: recording dodge decisions",lastSample=-math.huge,
+    local report={frames={},deaths={},life=0,status="V23: recording dodge decisions",lastSample=-math.huge,
         lastCaption=-math.huge,path="DQR_GildedV10/logs/dodge_last_death.json"}
     context.dodgeReports=report
     if cfg.harvardDodgeReports==nil then cfg.harvardDodgeReports=true end
@@ -1155,7 +1217,7 @@ local function installDodgeReports(context)
         local frames,deaths={},{}
         for i,frame in ipairs(report.frames) do frames[i]=frame end
         for i,death in ipairs(report.deaths) do deaths[i]=death end
-        return {version="V22.1",reason=reason,at=now,place_id=game.PlaceId,
+        return {version="V23",reason=reason,at=now,place_id=game.PlaceId,
             class=cfg.classProfile,npc_assist=cfg.harvardMobDodge~=false,
             speed21=cfg.harvardSpeed21~=false,life=report.life,recent_deaths=deaths,frames=frames}
     end
@@ -1182,7 +1244,7 @@ local function installDodgeReports(context)
     end
     function context.harvardSaveDodgeReport()
         local ok,result=persist(latest())
-        report.status=ok and "V22.1: dodge report saved" or "V22.1: report save failed"
+        report.status=ok and "V23: dodge report saved" or "V23: report save failed"
         message("Dodge report",ok and ("Saved "..report.path) or tostring(result))
         return ok,result
     end
@@ -1201,7 +1263,7 @@ local function installDodgeReports(context)
         if now-report.lastCaption<0.5 then return end
         report.lastCaption=now
         local mob=context.mobDodge
-        local text=cfg.harvardDodgeReports==false and "V22.1: dodge recording OFF" or report.status
+        local text=cfg.harvardDodgeReports==false and "V23: dodge recording OFF" or report.status
         if mob then
             text=text.." | NPC: "..tostring(mob.mode).." | read/used "
                 ..tostring(mob.sourceCount or 0).."/"..tostring(mob.acceptedCount or 0)
@@ -1227,7 +1289,7 @@ local function installDodgeReports(context)
             report.lastSample=-math.huge
         end
         local hurt=not changedHum and report.lastHealth and health<report.lastHealth
-        local died=hurt and health<=0
+        local died=hurt and report.lastHealth>0 and health<=0
         if now-report.lastSample<0.2 and not hurt then return end
         report.lastSample=now
         local mob=context.mobDodge
@@ -1259,6 +1321,11 @@ local function installDodgeReports(context)
             candidates=mob and mob.candidates,walls=mob and mob.blockedWalls,floor=mob and mob.blockedFloor,
             partial=mob and mob.partial,geometry_candidates=mob and mob.geometryCandidates,
             mage_margin=mob and finite(mob.reactionMargin),
+            body_reach=mob and finite(mob.bodyReach),motion_allowance=mob and finite(mob.motionAllowance),
+            effective_reach=mob and finite(mob.effectiveReach),finishing=mob and mob.finishing,
+            physical_priority=mob and mob.priorityPhysical,spacing_risk=mob and finite(mob.spacingRisk),
+            plan_origin=mob and vector(mob.planOrigin),plan_at=mob and finite(mob.planAt),
+            exposure_actual=mob and finite(mob.attackExposure),
             zones={},predictions={},keepouts={},wall_hits={},enemies={}}
         for _,hit in ipairs(mob and mob.wallHits or {}) do
             if #frame.wall_hits>=8 then break end
@@ -1305,13 +1372,18 @@ local function installDodgeReports(context)
         report.lastHealth=health
         if health>0 then report.lastAlive=frame end
         if died then
+            local replay={}
+            for i=math.max(1,#report.frames-23),#report.frames do
+                local prior=report.frames[i]
+                if prior.life==report.life then replay[#replay+1]=prior end
+            end
             report.deaths[#report.deaths+1]={life=report.life,at=now,life_age=frame.life_age,
-                pos=frame.pos,last_alive=report.lastAlive,death=frame}
+                pos=frame.pos,last_alive=report.lastAlive,death=frame,frames=replay}
             if #report.deaths>3 then table.remove(report.deaths,1) end
             report.lastDeath=build("death",now)
             local ok,result=persist(report.lastDeath)
-            report.status=ok and "V22.1: last death saved; Copy dodge report"
-                or "V22.1: last death buffered; Copy dodge report"
+            report.status=ok and "V23: last death saved; Copy dodge report"
+                or "V23: last death buffered; Copy dodge report"
             report.saveError=not ok and tostring(result) or nil
         end
     end
@@ -1319,7 +1391,7 @@ local function installDodgeReports(context)
     context.sliderConnections=context.sliderConnections or {}
     context.sliderConnections[#context.sliderConnections+1]=runService.Heartbeat:Connect(function()
         local ok,err=pcall(context.dodgeReportTick,os.clock())
-        if not ok then report.status="V22.1: report error";report.error=tostring(err) end
+        if not ok then report.status="V23: report error";report.error=tostring(err) end
     end)
 end
 
@@ -147400,7 +147472,7 @@ components.interfaceMainLoop = function(context)
         end, function(enabled)
             config.harvardMobDodge=enabled
             saveConfig()
-        end, 6, "V21 proximity spacing restored; mage impact margin and per-life diagnostics retained."))
+        end, 6, "Buffered escape handoff and shortest observed-attack exits before proximity preferences."))
         helper(uiLibrary.toggle(runsThisAccount, "Speed 21 (experimental)", function()
             return config.harvardSpeed21 ~= false
         end, function(enabled)
@@ -147424,7 +147496,7 @@ components.interfaceMainLoop = function(context)
             "Copy the last death's movement report, or the current report if there has been no death.")
         dodgeReportRow.add("Save dodge report", "secondary", function() context.harvardSaveDodgeReport() end,
             "Save the report as DQR_GildedV10/logs/dodge_last_death.json in the executor workspace.")
-        context.dodgeReports.caption=uiLibrary.label(runsThisAccount,"V22.1: recording dodge decisions","captionSub",10)
+        context.dodgeReports.caption=uiLibrary.label(runsThisAccount,"V23: recording dodge decisions","captionSub",10)
         context.dodgeReports.caption.Size=UDim2.new(1,0,0,38)
         context.dodgeReports.caption.TextWrapped=true
         local persistenceRow = uiLibrary.buttonRow(runsThisAccount, 3)
@@ -166113,7 +166185,7 @@ local ok, reason = xpcall(function()
     for index, name in ipairs(order) do
         if stopped then return end
         currentStage = name
-        print(("[DQR Harvard V22.1] Loading %d/18: %s"):format(index, name))
+        print(("[DQR Harvard V23] Loading %d/18: %s"):format(index, name))
         components[name](context)
         if name == "movementCombat" then
             installBossRecoveryMovement(context)
@@ -166130,7 +166202,7 @@ local ok, reason = xpcall(function()
         task.wait()
     end
     if stopped then return end
-    context.INTEGRATION_VERSION = "V22.1 Harvard spacing rollback"
+    context.INTEGRATION_VERSION = "V23 Harvard buffered attack exits"
     context.harvardPersistence.refresh()
     pcall(context.saveConfig)
     local dungeon = context.Workspace:FindFirstChild("dungeonName")
@@ -166145,10 +166217,10 @@ local ok, reason = xpcall(function()
     if context.notify then
         context.notify("run", "Harvard ready", "Auto-start dungeon: " .. (context.CFG.autoStartDungeon ~= false and "ON" or "OFF") .. ". All controls are in this menu.")
     end
-    print("[DQR Harvard V22.1] Ready: Harvard menu only; auto-start " .. tostring(context.CFG.autoStartDungeon ~= false))
+    print("[DQR Harvard V23] Ready: Harvard menu only; auto-start " .. tostring(context.CFG.autoStartDungeon ~= false))
 end, function(err) return debug.traceback(tostring(err), 2) end)
 if not ok then
-    warn("[DQR Harvard V22.1] " .. currentStage .. ": " .. tostring(reason))
+    warn("[DQR Harvard V23] " .. currentStage .. ": " .. tostring(reason))
     stopHarvardEngine()
     pcall(function()
         getService("StarterGui"):SetCore("SendNotification", {
@@ -166171,8 +166243,8 @@ local cached, cacheError = pcall(function()
     assert(readfile(cachePath)==payload, "saved engine verification failed")
 end)
 env.DQRHarvardCacheReady = cached
-if not cached then warn("[DQR Harvard V22_1] Auto-execute cache unavailable: "..tostring(cacheError)) end
+if not cached then warn("[DQR Harvard V23] Auto-execute cache unavailable: "..tostring(cacheError)) end
 assert(type(loadstring)=="function", "Executor loadstring is required to run the bundled engine")
-local run, compileError = loadstring(payload,"@DQR_Harvard_V22_1")
+local run, compileError = loadstring(payload,"@DQR_Harvard_V23")
 assert(run,tostring(compileError))
 return run()
