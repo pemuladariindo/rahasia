@@ -1,11 +1,14 @@
 --[[
-DQR GILDED V27 - HARVARD / EIF RECOVERY + NPC SPELL CASTS
+DQR GILDED V27.1 - HARVARD / ATTACK TIMING PATCH
 Run this complete file once. It saves its bundled engine in the executor's local
 workspace and runs it. No HTTP downloads or external code are used.
 
 Ready EIF can satisfy a legacy opening wait instead of waiting behind it.
 NPC spell casts have a guarded recovery path while the existing movement controller steers.
 An unknown spell, including Jade Rain, can make a nearby initial cast before area measurement.
+Boss buffs return to the original controller; the NPC recovery owner releases on boss targets.
+Current Stats ping and a short history of cast acknowledgements replace the worst-ever delay.
+Real cooldowns, EIF confirmation and the minimum cast window are still enforced.
 No guessed Jade Rain dimensions or animation IDs are installed.
 EIF must be active with enough time left for the damage skill's windup and input delay.
 Cooldown timing expires independently of a lingering marker; late casts wait for the next buff.
@@ -35,7 +38,7 @@ local env = type(getgenv) == "function" and getgenv() or _G
 local payload = [=====[
 -- DQR_HARVARD_RUNTIME_V12
 --[[
-DQR HARVARD V27 RUNTIME
+DQR HARVARD V27.1 RUNTIME
 All 18 user-supplied reference components; Harvard menu only.
 Per-account save/load, autosave and teleport auto-execute are available in Autofarm.
 This local cached engine is installed by DQR_Gilded_V12_AutoExec.lua.
@@ -502,6 +505,7 @@ local function installHarvardCombatAssist(context)
         state.permits={};state.eifCycle=nil;state.eifUntil=nil;state.eifRemaining=nil
         state.eifTimingSource=nil;state.lastEffect=nil
         state.casts={};state.buffRequests={};state.preparedAt=nil;state.targetCache=nil
+        state.startDelays={};state.delaySamples={}
     end
     local function sampleWindow(now)
         local slots,tools,required,innerSlot,character=loadout()
@@ -563,7 +567,8 @@ local function installHarvardCombatAssist(context)
                     anyReady=true
                     obs.cycle=nil;obs.endsAt=nil
                 end
-                if healthy and obs.fresh and obs.lastActive==true and not rawActive and obs.lastActiveAt and obs.castAt then
+                if healthy and obs.fresh and obs.lastActive==true and not rawActive and obs.lastActiveAt and obs.castAt
+                    and obs.sampleAt and now-obs.sampleAt<=0.25 then
                     local measured=obs.lastActiveAt-obs.castAt-0.1
                     if measured>=0.75 and measured<=duration then
                         learnedDuration[slots[slot]]=min(learnedDuration[slots[slot]] or duration,measured)
@@ -606,9 +611,18 @@ local function installHarvardCombatAssist(context)
         end
         windup=windup or validNumber(cfg.castWindupMax) or 1.3
         windup=max(windup,validNumber(cfg.castWindupMin) or 0.75,validNumber(cfg.castRootTime) or 0.7)
-        local ping=max(validNumber(rt.pingS) or 0,validNumber(rt.dataPingS) or 0)
-        local delay=slot and state.startDelays and state.startDelays[slot] or 0
-        local frame=min(0.2,max(0.03,state.sampleGap or 0))
+        -- Prefer the current Stats measurement to a stale route/manual estimate.
+        local ping=validNumber(rt.dataPingS)
+        if not ping or ping<0 then ping=max(0,validNumber(rt.pingS) or 0) end
+        local delays={}
+        for _,entry in ipairs(slot and state.delaySamples and state.delaySamples[slot] or {}) do
+            if os.clock()-entry.at<=20 then delays[#delays+1]=entry.value end
+        end
+        table.sort(delays)
+        local delay=#delays>0 and delays[math.ceil(#delays/2)] or 0
+        local report=context.dodgeReports
+        local frame=min(0.15,max(0.03,report and validNumber(report.maxGap) or 0))
+        state.eifPing=ping;state.eifInputDelay=delay;state.eifFrameMargin=frame
         -- Existing projectile lead is additional margin, not a verified server hit timestamp.
         local lead=name and (type(cfg.spellLead)=="table" and validNumber(cfg.spellLead[name])
             or context.SPELL_LEAD and validNumber(context.SPELL_LEAD[name])) or 0
@@ -693,8 +707,11 @@ local function installHarvardCombatAssist(context)
                 request.activeAtStart=sample.active;request.leftAtStart=sample.remaining
                 request.delay=max(0,startedAt-pressedAt)
                 if request.delay<=1.5 then
-                    state.startDelays=state.startDelays or {}
-                    state.startDelays[slot]=max(state.startDelays[slot] or 0,request.delay)
+                    state.delaySamples=state.delaySamples or {}
+                    local entries=state.delaySamples[slot] or {}
+                    state.delaySamples[slot]=entries
+                    entries[#entries+1]={at=startedAt,value=request.delay}
+                    while #entries>5 do table.remove(entries,1) end
                 end
                 return
             end
@@ -1054,9 +1071,15 @@ local function installHarvardCombatRecovery(context)
     context.buffPress=function(now)
         now=now or os.clock()
         local tools,buff=kit()
-        if not buff or not context.harvardPressAbility then return oldPress and oldPress(now) or false end
         local character,why=readyCharacter(now)
         if not character then state.recovery=why;return false end
+        local target=context.BR and context.BR.target
+        if live(target) and target.isBoss then
+            local sent=oldPress and oldPress(now) or false
+            state.recovery=sent and "EIF key requested" or "original boss buff"
+            return sent
+        end
+        if not buff or not context.harvardPressAbility then return oldPress and oldPress(now) or false end
         local phase=context.buffState(now)
         if phase~="ready" then state.recovery=phase=="up" and "EIF active" or "waiting for EIF cooldown";return false end
         if left(tools[buff]) and left(tools[buff])>0 then return false end
@@ -1073,7 +1096,9 @@ local function installHarvardCombatRecovery(context)
     local tick=context.buffTick
     context.buffTick=function(now)
         local tools,buff,damage=kit()
-        context.harvardNPCRecoveryOwns=buff~=nil and damage~=nil and cfg.classProfile=="mage"
+        local target=context.BR and context.BR.target
+        context.harvardNPCRecoveryOwns=not (live(target) and target.isBoss)
+            and buff~=nil and damage~=nil and cfg.classProfile=="mage"
             and cfg[damage=="q" and "autoQ" or "autoE"]~=false and rt.farmEnabled and not rt.destroyed
             and (not context.harvardInGilded or context.harvardInGilded(now)) or false
         if tick then
@@ -1096,6 +1121,12 @@ local function installHarvardCombatRecovery(context)
         if not buff then return end
         local character,why=readyCharacter(now)
         if not character then state.recovery=why;return end
+        local target=context.BR and context.BR.target
+        if live(target) and target.isBoss then
+            local cd=damage and left(tools[damage])
+            state.recovery=cd and cd>0 and "damage cooldown (boss)" or "original boss caster"
+            return
+        end
         if not damage or cfg.classProfile~="mage" or not context.harvardTryNPCSpell then return end
         if not context.harvardNPCRecoveryOwns then return end
         if cfg[damage=="q" and "autoQ" or "autoE"]==false then state.recovery="damage skill OFF";return end
@@ -2028,7 +2059,7 @@ end
 -- Bounded local replay of movement decisions. No network requests or movement.
 local function installDodgeReports(context)
     local cfg,rt=context.CFG,context.RT
-    local report={frames={},deaths={},life=0,status="V27: recording dodge decisions",lastSample=-math.huge,
+    local report={frames={},deaths={},life=0,status="V27.1: recording dodge decisions",lastSample=-math.huge,
         lastCaption=-math.huge,path="DQR_GildedV10/logs/dodge_last_death.json"}
     context.dodgeReports=report
     if cfg.harvardDodgeReports==nil then cfg.harvardDodgeReports=true end
@@ -2049,7 +2080,7 @@ local function installDodgeReports(context)
         local frames,deaths={},{}
         for i,frame in ipairs(report.frames) do frames[i]=frame end
         for i,death in ipairs(report.deaths) do deaths[i]=death end
-        return {version="V27",reason=reason,at=now,place_id=game.PlaceId,
+        return {version="V27.1",reason=reason,at=now,place_id=game.PlaceId,
             class=cfg.classProfile,npc_assist=cfg.harvardMobDodge~=false,
             speed21=cfg.harvardSpeed21~=false,pack_focus=cfg.harvardPackFocus~=false,
             strict_eif=cfg.harvardStrictEIF~=false,life=report.life,recent_deaths=deaths,frames=frames}
@@ -2077,7 +2108,7 @@ local function installDodgeReports(context)
     end
     function context.harvardSaveDodgeReport()
         local ok,result=persist(latest())
-        report.status=ok and "V27: dodge report saved" or "V27: report save failed"
+        report.status=ok and "V27.1: dodge report saved" or "V27.1: report save failed"
         message("Dodge report",ok and ("Saved "..report.path) or tostring(result))
         return ok,result
     end
@@ -2096,7 +2127,7 @@ local function installDodgeReports(context)
         if now-report.lastCaption<0.5 then return end
         report.lastCaption=now
         local mob=context.mobDodge
-        local text=cfg.harvardDodgeReports==false and "V27: dodge recording OFF" or report.status
+        local text=cfg.harvardDodgeReports==false and "V27.1: dodge recording OFF" or report.status
         if mob then
             text=text.." | NPC: "..tostring(mob.mode).." | read/used "
                 ..tostring(mob.sourceCount or 0).."/"..tostring(mob.acceptedCount or 0)
@@ -2171,7 +2202,9 @@ local function installDodgeReports(context)
             eif_required=combat and combat.eifRequired,eif_active=combat and combat.eifActive,
             eif_value=combat and finite(combat.eifValue),eif_marker_present=combat and combat.markerPresent,
             eif_marker_active=combat and combat.eifMarkerActive,eif_remaining=combat and finite(combat.eifRemaining),
-            eif_needed=combat and finite(combat.eifNeeded),eif_expires_at=combat and finite(combat.eifUntil),
+            eif_needed=combat and finite(combat.eifNeeded),
+            eif_ping_used=combat and finite(combat.eifPing),eif_input_delay=combat and finite(combat.eifInputDelay),
+            eif_frame_margin=combat and finite(combat.eifFrameMargin),eif_expires_at=combat and finite(combat.eifUntil),
             eif_cycle=combat and combat.eifCycle,eif_timing_source=combat and combat.eifTimingSource,
             eif_reason=combat and combat.eifReason,eif_sample_at=combat and finite(combat.eifAt),
             loadout_q=combat and combat.slots and combat.slots.q,loadout_e=combat and combat.slots and combat.slots.e,
@@ -2258,8 +2291,8 @@ local function installDodgeReports(context)
             if #report.deaths>3 then table.remove(report.deaths,1) end
             report.lastDeath=build("death",now)
             local ok,result=persist(report.lastDeath)
-            report.status=ok and "V27: last death saved; Copy dodge report"
-                or "V27: last death buffered; Copy dodge report"
+            report.status=ok and "V27.1: last death saved; Copy dodge report"
+                or "V27.1: last death buffered; Copy dodge report"
             report.saveError=not ok and tostring(result) or nil
         end
     end
@@ -2267,7 +2300,7 @@ local function installDodgeReports(context)
     context.sliderConnections=context.sliderConnections or {}
     context.sliderConnections[#context.sliderConnections+1]=runService.Heartbeat:Connect(function()
         local ok,err=pcall(context.dodgeReportTick,os.clock())
-        if not ok then report.status="V27: report error";report.error=tostring(err) end
+        if not ok then report.status="V27.1: report error";report.error=tostring(err) end
     end)
 end
 
@@ -148470,7 +148503,7 @@ components.interfaceMainLoop = function(context)
             "Copy the last death's movement report, or the current report if there has been no death.")
         dodgeReportRow.add("Save dodge report", "secondary", function() context.harvardSaveDodgeReport() end,
             "Save the report as DQR_GildedV10/logs/dodge_last_death.json in the executor workspace.")
-        context.dodgeReports.caption=uiLibrary.label(runsThisAccount,"V27: recording dodge decisions","captionSub",10)
+        context.dodgeReports.caption=uiLibrary.label(runsThisAccount,"V27.1: recording dodge decisions","captionSub",10)
         context.dodgeReports.caption.Size=UDim2.new(1,0,0,88)
         context.dodgeReports.caption.TextWrapped=true
         local persistenceRow = uiLibrary.buttonRow(runsThisAccount, 3)
@@ -167162,7 +167195,7 @@ local ok, reason = xpcall(function()
     for index, name in ipairs(order) do
         if stopped then return end
         currentStage = name
-        print(("[DQR Harvard V27] Loading %d/18: %s"):format(index, name))
+        print(("[DQR Harvard V27.1] Loading %d/18: %s"):format(index, name))
         components[name](context)
         if name == "movementCombat" then
             installBossRecoveryMovement(context)
@@ -167181,7 +167214,7 @@ local ok, reason = xpcall(function()
         task.wait()
     end
     if stopped then return end
-    context.INTEGRATION_VERSION = "V27 Harvard live EIF recovery and nearby NPC spell casts"
+    context.INTEGRATION_VERSION = "V27.1 Harvard scoped NPC recovery and current cast delay"
     context.harvardPersistence.refresh()
     pcall(context.saveConfig)
     local dungeon = context.Workspace:FindFirstChild("dungeonName")
@@ -167196,10 +167229,10 @@ local ok, reason = xpcall(function()
     if context.notify then
         context.notify("run", "Harvard ready", "Auto-start dungeon: " .. (context.CFG.autoStartDungeon ~= false and "ON" or "OFF") .. ". All controls are in this menu.")
     end
-    print("[DQR Harvard V27] Ready: Harvard menu only; auto-start " .. tostring(context.CFG.autoStartDungeon ~= false))
+    print("[DQR Harvard V27.1] Ready: Harvard menu only; auto-start " .. tostring(context.CFG.autoStartDungeon ~= false))
 end, function(err) return debug.traceback(tostring(err), 2) end)
 if not ok then
-    warn("[DQR Harvard V27] " .. currentStage .. ": " .. tostring(reason))
+    warn("[DQR Harvard V27.1] " .. currentStage .. ": " .. tostring(reason))
     stopHarvardEngine()
     pcall(function()
         getService("StarterGui"):SetCore("SendNotification", {
@@ -167222,8 +167255,8 @@ local cached, cacheError = pcall(function()
     assert(readfile(cachePath)==payload, "saved engine verification failed")
 end)
 env.DQRHarvardCacheReady = cached
-if not cached then warn("[DQR Harvard V27] Auto-execute cache unavailable: "..tostring(cacheError)) end
+if not cached then warn("[DQR Harvard V27.1] Auto-execute cache unavailable: "..tostring(cacheError)) end
 assert(type(loadstring)=="function", "Executor loadstring is required to run the bundled engine")
-local run, compileError = loadstring(payload,"@DQR_Harvard_V27")
+local run, compileError = loadstring(payload,"@DQR_Harvard_V27.1")
 assert(run,tostring(compileError))
 return run()
