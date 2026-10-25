@@ -1,36 +1,14 @@
 --[[
-DQR GILDED V27.1 - HARVARD / ATTACK TIMING PATCH
-Run this complete file once. It saves its bundled engine in the executor's local
-workspace and runs it. No HTTP downloads or external code are used.
-
-Ready EIF can satisfy a legacy opening wait instead of waiting behind it.
-NPC spell casts have a guarded recovery path while the existing movement controller steers.
-An unknown spell, including Jade Rain, can make a nearby initial cast before area measurement.
-Boss buffs return to the original controller; the NPC recovery owner releases on boss targets.
-Current Stats ping and a short history of cast acknowledgements replace the worst-ever delay.
-Real cooldowns, EIF confirmation and the minimum cast window are still enforced.
-No guessed Jade Rain dimensions or animation IDs are installed.
-EIF must be active with enough time left for the damage skill's windup and input delay.
-Cooldown timing expires independently of a lingering marker; late casts wait for the next buff.
-Boss casts use the same window. Deferred key retries expire and cannot cross buff cycles.
-Saved controls and the EIF windup window are retained. NPC recovery runs after hazard sensing.
-V24 dodge movement and the saved movement-speed choice are retained.
-Harvard > Autofarm:
-- Focus enemy packs / Require active EIF for damage (ON by default, saved per account)
-- Mob dodge assist / Predict mage windups (ON by default)
-- Record dodge reports / Copy dodge report / Save dodge report
-- Save config now / Load saved config
-- Auto-execute after teleport (ON by default)
-- Copy AutoExec loader (optional: add to the executor's startup AutoExec feature)
-
-Settings are per Roblox account. Existing V10/V11 settings are preserved.
-Automatic settings saves remain every 10 seconds and before teleports.
-Teleport auto-execute requires queue_on_teleport (or a supported equivalent),
-writefile, readfile, isfile, and loadstring. The menu shows whether it is ready.
-Restarting the Roblox app still needs executor startup AutoExec/reinjection.
-The script cannot keep Roblox running after the app closes or the device sleeps.
-Only the Harvard menu is used; all 18 supplied reference components are embedded.
-Compiled and tested locally with mocks; not tested in an actual dungeon.
+DQR GILDED V28.1 / HARVARD / NPC CAST RANGE + ORBIT PATCH
+Standalone installer: replaces the runtime embedded below and retains saved settings.
+NPC spells use the original controller's cast range, including unknown area skills.
+Valid NPC escape routes favor staying within that same range.
+The regular NPC orbit's preferred radius also follows that range.
+Its original simulator can still move outward to escape danger.
+Damage-wait diagnostics persist separately from routine buff polling.
+Cleared escapes release movement after the existing physical handoff buffer.
+Boss movement, speed logic, confirmed EIF timing and real cooldowns are retained.
+No Jade Rain area dimensions or animation IDs are guessed.
 ]]
 local cachePath = "DQR_GildedV10/runtime/harvard_v12_engine.lua"
 local env = type(getgenv) == "function" and getgenv() or _G
@@ -38,7 +16,7 @@ local env = type(getgenv) == "function" and getgenv() or _G
 local payload = [=====[
 -- DQR_HARVARD_RUNTIME_V12
 --[[
-DQR HARVARD V27.1 RUNTIME
+DQR HARVARD V28.1 RUNTIME
 All 18 user-supplied reference components; Harvard menu only.
 Per-account save/load, autosave and teleport auto-execute are available in Autofarm.
 This local cached engine is installed by DQR_Gilded_V12_AutoExec.lua.
@@ -949,7 +927,9 @@ local function installHarvardCombatRecovery(context)
         local char=context.LocalPlayer.Character
         if state.recoveryCharacter~=char then
             state.recoveryCharacter=char;state.deliveryAt={};state.buffInputs={}
-            state.buffAttemptAt=nil;state.damageCheckAt=nil
+            state.buffAttemptAt=nil;state.damageCheckAt=nil;state.engagementTarget=nil
+            state.damageStatus=nil;state.damageStatusAt=nil;state.buffRecovery=nil
+            state.orbitBase=nil;state.orbitDesired=nil;state.orbitAt=nil
         end
         for _,container in pairs({context.LocalPlayer.Backpack,char}) do
             if container then for _,tool in ipairs(container:GetChildren()) do
@@ -1050,27 +1030,91 @@ local function installHarvardCombatRecovery(context)
         if not hit then return true end
         return hit.Instance and hit.Instance.IsDescendantOf and hit.Instance:IsDescendantOf(e.model) or false
     end
+    local function room(e)
+        local parent=e and e.model and e.model.Parent
+        for _=1,10 do
+            if not parent or parent==context.Workspace then return nil end
+            local label=name(parent.Name)
+            if label:match("^room%d+$") or label:match("^g%d+$") then return parent end
+            parent=parent.Parent
+        end
+    end
     local function targetAt(origin,limit,needVisible)
         local target=context.BR and context.BR.target
+        local encounter=live(target) and room(target)
         local best,distance=nil,limit*limit
+        local function eligible(e)
+            if not live(e) or e.isBoss or math.abs(e.root.Position.Y-origin.Y)>=16 then return false end
+            local folder=room(e)
+            return not (encounter and folder and encounter~=folder) and (not needVisible or visible(origin,e))
+        end
         for _,e in ipairs(rd.enemies or {}) do
-            if live(e) and math.abs(e.root.Position.Y-origin.Y)<16 and (not needVisible or visible(origin,e)) then
+            if eligible(e) then
                 local p=e.root.Position
                 local d=(p.X-origin.X)^2+(p.Z-origin.Z)^2
-                if d<distance then best,distance=e,d end
+                if d<=distance then best,distance=e,d end
             end
         end
-        if live(target) then
-            local p=target.root.Position
+        -- Keep an in-range aim stable when two moving NPCs trade nearest place.
+        local prior=state.engagementTarget
+        if eligible(prior) then
+            local p=prior.root.Position
             local d=(p.X-origin.X)^2+(p.Z-origin.Z)^2
-            if d<=distance+4 and d<=limit*limit and (not needVisible or visible(origin,target)) then best=target end
+            if d<=limit*limit and math.sqrt(d)<=math.sqrt(distance)+4 then best=prior end
         end
         return best
+    end
+    local function castReach(tools,damage)
+        local reach=tonumber(context.fireReach and context.fireReach()) or 40
+        if reach~=reach or reach<=0 or reach==math.huge then reach=40 end
+        local measured=rd.abilitySlots and rd.abilitySlots[damage]
+        local known=type(cfg.aoeKnown)=="table" and tools[damage] and cfg.aoeKnown[name(tools[damage].Name)]
+        local observed=measured and measured.measured and measured.aoeX and measured.aoeZ
+        state.damageReach=reach
+        state.footprintSource=known and "known area" or observed and "measured area" or "existing cast range"
+        -- Range comes from the original controller. Unknown area geometry
+        -- disables pack aiming; it must not impose a second, shorter range.
+        return reach
+    end
+    function context.harvardNPCCombatIntent(origin,now)
+        if not context.harvardNPCRecoveryOwns then return nil end
+        local current=context.BR and context.BR.target
+        if live(current) and current.isBoss then return nil end
+        local tools,buff,damage=kit()
+        if not buff or not damage then return nil end
+        local reach=castReach(tools,damage)
+        local target=targetAt(origin,reach,true)
+        if not target then target=targetAt(origin,math.min(160,reach+60),true) end
+        state.engagementTarget=target
+        state.engagementDistance=target and (Vector3.new(target.root.Position.X-origin.X,0,target.root.Position.Z-origin.Z)).Magnitude
+        state.engagementAt=now
+        if not target then return nil end
+        return {target=target,point=target.root.Position,reach=reach,at=now}
+    end
+    function context.harvardNPCRingRadius(radius,origin,now,members)
+        if not context.harvardNPCRecoveryOwns or rt.destroyed or rt.modHalt or not rt.farmEnabled then return radius end
+        local current=context.BR and context.BR.target
+        if live(current) and current.isBoss then return radius end
+        local intent=context.harvardNPCCombatIntent(origin,now)
+        if not intent then return radius end
+        local inGroup=false
+        for _,enemy in ipairs(members or {}) do
+            if enemy==intent.target or enemy.model and enemy.model==intent.target.model then inGroup=true;break end
+        end
+        if not inGroup then return radius end
+        local base=tonumber(radius)
+        if not base or base~=base or base<=0 or base==math.huge then return radius end
+        -- Only the preferred radius changes. The original orbit simulator
+        -- can still move outward or choose another route to avoid an attack.
+        local minimum=math.max(8,tonumber(cfg.gsFwdRMin) or 14)
+        local desired=math.min(base,math.max(minimum,intent.reach-6))
+        state.orbitBase=base;state.orbitDesired=desired;state.orbitAt=now
+        return desired
     end
     local oldPress=context.buffPress
     context.buffPress=function(now)
         now=now or os.clock()
-        local tools,buff=kit()
+        local tools,buff,damage=kit()
         local character,why=readyCharacter(now)
         if not character then state.recovery=why;return false end
         local target=context.BR and context.BR.target
@@ -1085,8 +1129,8 @@ local function installHarvardCombatRecovery(context)
         if left(tools[buff]) and left(tools[buff])>0 then return false end
         if now-(state.buffAttemptAt or -math.huge)<0.5 then return false end
         if context.gsStartHold and context.gsStartHold(now) then state.recovery="spawn barrier";return false end
-        local reach=(context.fireReach and context.fireReach() or 60)+25
-        if not targetAt(character.root.Position,reach) then state.recovery="no nearby enemy";return false end
+        local reach=damage and castReach(tools,damage) or (context.fireReach and context.fireReach() or 40)
+        if not targetAt(character.root.Position,reach,true) then state.recovery="approaching spell range";return false end
         state.buffAttemptAt=now
         local key=buff=="q" and Enum.KeyCode.Q or Enum.KeyCode.E
         local sent=context.harvardPressAbility(key)
@@ -1108,6 +1152,11 @@ local function installHarvardCombatRecovery(context)
         if not buff then return end
         local character,why=readyCharacter(now)
         if not character then state.recovery=why;return end
+        if context.harvardNPCRecoveryOwns then
+            context.harvardNPCCombatIntent(character.root.Position,now)
+        else
+            state.engagementTarget=nil;state.engagementDistance=nil;state.damageReach=nil
+        end
         if context.buffState(now)=="ready" then
             -- Original buffTick waits on firstCastWaitAt. A ready EIF must be
             -- allowed to satisfy that opening wait instead of depending on it.
@@ -1115,44 +1164,51 @@ local function installHarvardCombatRecovery(context)
             return
         end
     end
+    local function damageStatus(reason,now)
+        state.recovery=reason;state.damageStatus=reason;state.damageStatusAt=now
+    end
     -- Called after this frame's movement/hazard sensing, not before it.
     context.harvardCombatRecoveryTick=function(now)
         local tools,buff,damage=kit()
         if not buff then return end
         local character,why=readyCharacter(now)
-        if not character then state.recovery=why;return end
+        if not character then damageStatus(why,now);return end
         local target=context.BR and context.BR.target
         if live(target) and target.isBoss then
             local cd=damage and left(tools[damage])
-            state.recovery=cd and cd>0 and "damage cooldown (boss)" or "original boss caster"
+            damageStatus(cd and cd>0 and "damage cooldown (boss)" or "original boss caster",now)
             return
         end
         if not damage or cfg.classProfile~="mage" or not context.harvardTryNPCSpell then return end
         if not context.harvardNPCRecoveryOwns then return end
-        if cfg[damage=="q" and "autoQ" or "autoE"]==false then state.recovery="damage skill OFF";return end
+        if cfg[damage=="q" and "autoQ" or "autoE"]==false then damageStatus("damage skill OFF",now);return end
         if now-(state.damageCheckAt or -math.huge)<0.08 then return end
         state.damageCheckAt=now
         local allowed,reason=context.attackAllowedBySkill(now)
-        if not allowed then state.recovery=reason;return end
-        if not context.slotReady(damage) then state.recovery="damage cooldown";return end
-        local measured=rd.abilitySlots and rd.abilitySlots[damage]
-        local known=type(cfg.aoeKnown)=="table" and cfg.aoeKnown[name(tools[damage].Name)]
-        local observed=measured and measured.measured and measured.aoeX and measured.aoeZ
-        local reach=context.fireReach and context.fireReach() or 40
-        -- An unknown spell gets an initial nearby cast. Its real projectile
-        -- measurement can then supply the pack footprint; no dimensions are invented.
-        if not known and not observed then reach=math.min(reach,40) end
-        state.footprintSource=known and "known area" or observed and "measured area" or "initial nearby cast"
+        if not allowed then damageStatus(reason,now);return end
+        if not context.slotReady(damage) then damageStatus("damage cooldown",now);return end
+        local reach=castReach(tools,damage)
         local target=targetAt(character.root.Position,reach,true)
-        if not target then state.recovery="target outside spell reach";return end
-        if target.isBoss then state.recovery="original boss caster";return end
+        if not target then damageStatus("target outside spell reach",now);return end
+        if target.isBoss then damageStatus("original boss caster",now);return end
+        state.engagementTarget=target
+        state.engagementDistance=(Vector3.new(target.root.Position.X-character.root.Position.X,0,target.root.Position.Z-character.root.Position.Z)).Magnitude
         local success,stage=context.harvardTryNPCSpell(damage,target,now)
-        state.recovery=success and "damage key requested" or tostring(stage or "aligning damage")
+        damageStatus(success and "damage key requested" or tostring(stage or "aligning damage"),now)
+    end
+    local press=context.buffPress
+    context.buffPress=function(now)
+        now=now or os.clock()
+        local sent=press(now)
+        state.buffRecovery=state.recovery
+        -- A routine buff-status poll must not erase why damage is waiting.
+        if state.damageStatusAt and now-state.damageStatusAt<=0.5 then state.recovery=state.damageStatus end
+        return sent
     end
 end
 
 -- NPC-only escape patterns. Boss frames always return to the original brain.
--- V24 anticipates closing Knights without treating their range as a solid wall.
+-- NPC escape routes keep the original cast range as a soft objective.
 local function installMobReflex(context)
     local cfg, rt, rd = context.CFG, context.RT, context.RD
     local state = {active=false, mode="IDLE", zones={}, raw={}, lastRead=-math.huge,
@@ -1717,6 +1773,22 @@ local function installMobReflex(context)
         local name=string.lower(tostring(strongest and strongest.name or ""))
         local melee=strongest and strongest.spacing or name=="gs swing" or name:find("warrior",1,true)
         local caster=strongest and casterFor(strongest,origin)
+        local intent=context.harvardNPCCombatIntent and context.harvardNPCCombatIntent(origin,now)
+        local objective=intent and intent.point
+        local castRange=intent and intent.reach
+        state.objectivePoint=objective;state.objectiveReach=castRange
+        state.objectiveDistance=objective and distance(origin,objective)
+        if objective and castRange and state.objectiveDistance>castRange-4 then
+            local toward=Vector3.new(objective.X-origin.X,0,objective.Z-origin.Z)
+            if toward.Magnitude>0.1 then
+                local forward=toward.Unit
+                local side=Vector3.new(-forward.Z,0,forward.X)
+                local step=min(16,max(4,toward.Magnitude-max(8,castRange-4)))
+                points[#points+1]=origin+forward*step
+                points[#points+1]=origin+forward*step+side*9
+                points[#points+1]=origin+forward*step-side*9
+            end
+        end
         if melee and caster then
             local away=Vector3.new(origin.X-caster.root.Position.X,0,origin.Z-caster.root.Position.Z)
             if away.Magnitude>0.1 then
@@ -1768,6 +1840,11 @@ local function installMobReflex(context)
         state.planOrigin=origin;state.planAt=now
         local started=os.clock()
         local function preference(score,raw)
+            if objective and castRange then
+                -- This changes only the cost among valid escapes. Actual
+                -- attack exposure, deadlines and collision checks still win.
+                score+=max(0,distance(raw,objective)-max(8,castRange-4))*12
+            end
             if melee and caster then
                 score+=max(0,distance(origin,caster.root.Position)-distance(raw,caster.root.Position))*5
             end
@@ -1991,7 +2068,9 @@ local function installMobReflex(context)
         state.predictedRisk=baseline
         local reached=state.goal and distance(origin,state.goal)<2.5
         if baseline<=0 then
-            if not state.active or reached or now>(state.holdUntil or 0) then clearState(); return false end
+            -- The physical handoff buffer above has already cleared. Do not
+            -- finish an old retreat after it stops serving an escape.
+            clearState();return false
         end
         local goalRisk=state.goal and max((risk(state.goal,now,distance(origin,state.goal)/speed,reach,height,lead,state.priorityPhysical)),
             (risk(state.goal,now,lead,reach,height,0.1,state.priorityPhysical))) or math.huge
@@ -2059,7 +2138,7 @@ end
 -- Bounded local replay of movement decisions. No network requests or movement.
 local function installDodgeReports(context)
     local cfg,rt=context.CFG,context.RT
-    local report={frames={},deaths={},life=0,status="V27.1: recording dodge decisions",lastSample=-math.huge,
+    local report={frames={},deaths={},life=0,status="V28.1: recording dodge decisions",lastSample=-math.huge,
         lastCaption=-math.huge,path="DQR_GildedV10/logs/dodge_last_death.json"}
     context.dodgeReports=report
     if cfg.harvardDodgeReports==nil then cfg.harvardDodgeReports=true end
@@ -2080,7 +2159,7 @@ local function installDodgeReports(context)
         local frames,deaths={},{}
         for i,frame in ipairs(report.frames) do frames[i]=frame end
         for i,death in ipairs(report.deaths) do deaths[i]=death end
-        return {version="V27.1",reason=reason,at=now,place_id=game.PlaceId,
+        return {version="V28.1",reason=reason,at=now,place_id=game.PlaceId,
             class=cfg.classProfile,npc_assist=cfg.harvardMobDodge~=false,
             speed21=cfg.harvardSpeed21~=false,pack_focus=cfg.harvardPackFocus~=false,
             strict_eif=cfg.harvardStrictEIF~=false,life=report.life,recent_deaths=deaths,frames=frames}
@@ -2108,7 +2187,7 @@ local function installDodgeReports(context)
     end
     function context.harvardSaveDodgeReport()
         local ok,result=persist(latest())
-        report.status=ok and "V27.1: dodge report saved" or "V27.1: report save failed"
+        report.status=ok and "V28.1: dodge report saved" or "V28.1: report save failed"
         message("Dodge report",ok and ("Saved "..report.path) or tostring(result))
         return ok,result
     end
@@ -2127,7 +2206,7 @@ local function installDodgeReports(context)
         if now-report.lastCaption<0.5 then return end
         report.lastCaption=now
         local mob=context.mobDodge
-        local text=cfg.harvardDodgeReports==false and "V27.1: dodge recording OFF" or report.status
+        local text=cfg.harvardDodgeReports==false and "V28.1: dodge recording OFF" or report.status
         if mob then
             text=text.." | NPC: "..tostring(mob.mode).." | read/used "
                 ..tostring(mob.sourceCount or 0).."/"..tostring(mob.acceptedCount or 0)
@@ -2136,6 +2215,9 @@ local function installDodgeReports(context)
         if combat then
             text=text.."\nCombat: "..tostring(combat.recovery or "waiting").." | EIF: "..tostring(combat.eifReason or "waiting")
                 ..(" | %.1fs left / %.1fs needed"):format(combat.eifRemaining or 0,combat.eifNeeded or 0)
+            if combat.engagementDistance and combat.damageReach then
+                text=text..(" | target %.0f / reach %.0f"):format(combat.engagementDistance,combat.damageReach)
+            end
         end
         if report.caption and report.caption.Parent then report.caption.Text=text end
     end
@@ -2216,6 +2298,14 @@ local function installDodgeReports(context)
             npc_cast_owner=context.harvardNPCRecoveryOwns,combat_recovery=combat and combat.recovery,buff_slot=combat and combat.buffSlot,
             damage_slot=combat and combat.damageSlot,buff_cd_live=combat and finite(combat.liveBuffCooldown),
             damage_cd_live=combat and finite(combat.liveDamageCooldown),footprint_source=combat and combat.footprintSource,
+            combat_recovery_at=combat and finite(combat.damageStatusAt),buff_recovery=combat and combat.buffRecovery,
+            npc_orbit_base=combat and finite(combat.orbitBase),npc_orbit_desired=combat and finite(combat.orbitDesired),
+            npc_orbit_at=combat and finite(combat.orbitAt),
+            npc_orbit_radius=context.harvardNPCRecoveryOwns and rt.gsFwd and finite(rt.gsFwd.R) or nil,
+            npc_orbit_offset=context.harvardNPCRecoveryOwns and rt.gsFwd and finite(rt.gsFwd.o) or nil,
+            npc_target=combat and combat.engagementTarget and combat.engagementTarget.model and combat.engagementTarget.model.Name,
+            npc_target_distance=combat and finite(combat.engagementDistance),npc_cast_reach=combat and finite(combat.damageReach),
+            dodge_objective=mob and vector(mob.objectivePoint),dodge_objective_reach=mob and finite(mob.objectiveReach),
             first_cast_wait_age=rt.firstCastWaitAt and finite(now-rt.firstCastWaitAt),
             auto_q=cfg.autoQ,auto_e=cfg.autoE,
             zones={},predictions={},keepouts={},warning_deadlines={},wall_hits={},enemies={},skill_requests={},buff_inputs={}} 
@@ -2291,8 +2381,8 @@ local function installDodgeReports(context)
             if #report.deaths>3 then table.remove(report.deaths,1) end
             report.lastDeath=build("death",now)
             local ok,result=persist(report.lastDeath)
-            report.status=ok and "V27.1: last death saved; Copy dodge report"
-                or "V27.1: last death buffered; Copy dodge report"
+            report.status=ok and "V28.1: last death saved; Copy dodge report"
+                or "V28.1: last death buffered; Copy dodge report"
             report.saveError=not ok and tostring(result) or nil
         end
     end
@@ -2300,7 +2390,7 @@ local function installDodgeReports(context)
     context.sliderConnections=context.sliderConnections or {}
     context.sliderConnections[#context.sliderConnections+1]=runService.Heartbeat:Connect(function()
         local ok,err=pcall(context.dodgeReportTick,os.clock())
-        if not ok then report.status="V27.1: report error";report.error=tostring(err) end
+        if not ok then report.status="V28.1: report error";report.error=tostring(err) end
     end)
 end
 
@@ -16541,6 +16631,9 @@ components.hazardReader = function(context)
                     lines, argument2, ringR = value31, value32, value33
                 end
             end
+        end
+        if not value and context.harvardNPCRingRadius then
+            ringR = context.harvardNPCRingRadius(ringR, vector, argument, value7)
         end
         local value34, value35 = math.max(ringR, config.gsFwdRMax or 46), runtimeState.gsFwd
         local value36, value37, value38 = value35
@@ -148503,7 +148596,7 @@ components.interfaceMainLoop = function(context)
             "Copy the last death's movement report, or the current report if there has been no death.")
         dodgeReportRow.add("Save dodge report", "secondary", function() context.harvardSaveDodgeReport() end,
             "Save the report as DQR_GildedV10/logs/dodge_last_death.json in the executor workspace.")
-        context.dodgeReports.caption=uiLibrary.label(runsThisAccount,"V27.1: recording dodge decisions","captionSub",10)
+        context.dodgeReports.caption=uiLibrary.label(runsThisAccount,"V28.1: recording dodge decisions","captionSub",10)
         context.dodgeReports.caption.Size=UDim2.new(1,0,0,88)
         context.dodgeReports.caption.TextWrapped=true
         local persistenceRow = uiLibrary.buttonRow(runsThisAccount, 3)
@@ -167195,7 +167288,7 @@ local ok, reason = xpcall(function()
     for index, name in ipairs(order) do
         if stopped then return end
         currentStage = name
-        print(("[DQR Harvard V27.1] Loading %d/18: %s"):format(index, name))
+        print(("[DQR Harvard V28.1] Loading %d/18: %s"):format(index, name))
         components[name](context)
         if name == "movementCombat" then
             installBossRecoveryMovement(context)
@@ -167214,7 +167307,7 @@ local ok, reason = xpcall(function()
         task.wait()
     end
     if stopped then return end
-    context.INTEGRATION_VERSION = "V27.1 Harvard scoped NPC recovery and current cast delay"
+    context.INTEGRATION_VERSION = "V28.1 Harvard shared cast range and NPC orbit range"
     context.harvardPersistence.refresh()
     pcall(context.saveConfig)
     local dungeon = context.Workspace:FindFirstChild("dungeonName")
@@ -167229,10 +167322,10 @@ local ok, reason = xpcall(function()
     if context.notify then
         context.notify("run", "Harvard ready", "Auto-start dungeon: " .. (context.CFG.autoStartDungeon ~= false and "ON" or "OFF") .. ". All controls are in this menu.")
     end
-    print("[DQR Harvard V27.1] Ready: Harvard menu only; auto-start " .. tostring(context.CFG.autoStartDungeon ~= false))
+    print("[DQR Harvard V28.1] Ready: Harvard menu only; auto-start " .. tostring(context.CFG.autoStartDungeon ~= false))
 end, function(err) return debug.traceback(tostring(err), 2) end)
 if not ok then
-    warn("[DQR Harvard V27.1] " .. currentStage .. ": " .. tostring(reason))
+    warn("[DQR Harvard V28.1] " .. currentStage .. ": " .. tostring(reason))
     stopHarvardEngine()
     pcall(function()
         getService("StarterGui"):SetCore("SendNotification", {
@@ -167255,8 +167348,8 @@ local cached, cacheError = pcall(function()
     assert(readfile(cachePath)==payload, "saved engine verification failed")
 end)
 env.DQRHarvardCacheReady = cached
-if not cached then warn("[DQR Harvard V27.1] Auto-execute cache unavailable: "..tostring(cacheError)) end
+if not cached then warn("[DQR Harvard V28.1] Auto-execute cache unavailable: "..tostring(cacheError)) end
 assert(type(loadstring)=="function", "Executor loadstring is required to run the bundled engine")
-local run, compileError = loadstring(payload,"@DQR_Harvard_V27.1")
+local run, compileError = loadstring(payload,"@DQR_Harvard_V28.1")
 assert(run,tostring(compileError))
 return run()
