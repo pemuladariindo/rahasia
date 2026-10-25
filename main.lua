@@ -1,12 +1,12 @@
 --[[
-DQR GILDED V23 - HARVARD / BUFFERED ATTACK EXITS
+DQR GILDED V24 - HARVARD / KNIGHT APPROACH WARNINGS
 Run this complete file once. It saves its bundled engine in the executor's local
 workspace and runs it. No HTTP downloads or external code are used.
 
-NPC escapes reserve movement clearance for measured network and frame delay.
-Observed attack exits take priority over speculative melee proximity bands.
-Shortened wall routes are compared with other complete exits before committing.
-Reports count each death once and retain recent replay frames for each life.
+Closing Knights can trigger advisory steering before a ground marker appears.
+Advisory spacing never forbids crossing a real beam's shortest escape route.
+Knight circle markers carry an earlier planning deadline; the original reader is unchanged.
+Original boss/combat components and the saved movement-speed choice are retained.
 Harvard > Autofarm:
 - Mob dodge assist / Predict mage windups (ON by default)
 - Record dodge reports / Copy dodge report / Save dodge report
@@ -29,7 +29,7 @@ local env = type(getgenv) == "function" and getgenv() or _G
 local payload = [=====[
 -- DQR_HARVARD_RUNTIME_V12
 --[[
-DQR HARVARD V23 RUNTIME
+DQR HARVARD V24 RUNTIME
 All 18 user-supplied reference components; Harvard menu only.
 Per-account save/load, autosave and teleport auto-execute are available in Autofarm.
 This local cached engine is installed by DQR_Gilded_V12_AutoExec.lua.
@@ -355,7 +355,7 @@ local function installHarvardPersistence(context)
 end
 
 -- NPC-only escape patterns. Boss frames always return to the original brain.
--- V23 retains clearance at handoff and prioritizes observed attack exits.
+-- V24 anticipates closing Knights without treating their range as a solid wall.
 local function installMobReflex(context)
     local cfg, rt, rd = context.CFG, context.RT, context.RD
     local state = {active=false, mode="IDLE", zones={}, raw={}, lastRead=-math.huge,
@@ -542,7 +542,23 @@ local function installMobReflex(context)
                 if (known[string.lower(tostring(zone.name or ""))] or zone.attack==true and ownedByMob(zone))
                     and not zone.safe and not zone.heal
                     and (zone.untilAt or now+1)>now then
-                    state.zones[#state.zones+1]=zone
+                    local name=string.lower(tostring(zone.name or ""))
+                    if (name=="gs kcircle" or name=="dracaniknightcircle") and zone.r then
+                        -- Recorded Knight deaths occur about one second after
+                        -- the warning appears. Keep the raw reader unchanged;
+                        -- plan against an earlier deadline on our own copy.
+                        local warning={}
+                        for key,value in pairs(zone) do warning[key]=value end
+                        local spawn=tonumber(zone.from) or now
+                        warning.readerFrom=spawn;warning.warning=true
+                        warning.impactAt=spawn+1.0
+                        warning.from=warning.impactAt-reactionMargin()
+                        warning.anticipate=spawn
+                        if zone.cy and abs(zone.cy-origin.Y)<16 then warning.ground=true end
+                        state.zones[#state.zones+1]=warning
+                    else
+                        state.zones[#state.zones+1]=zone
+                    end
                     state.acceptedCount+=1
                 end
             end
@@ -661,6 +677,50 @@ local function installMobReflex(context)
                 end
             end
         end
+        state.knightAlerts=0;state.approachThreat=nil
+        if cfg.classProfile=="mage" then
+            local _,hum,root=context.character()
+            local velocity=root and root.AssemblyLinearVelocity or Vector3.zero
+            local pv=Vector3.new(velocity.X,0,velocity.Z)
+            local moveSpeed=max(tonumber(hum and hum.WalkSpeed) or 16,1)
+            if pv.Magnitude>moveSpeed then pv=pv.Unit*moveSpeed end
+            local body=root and max(root.Size.X,root.Size.Z)*0.5+1.3 or 2.3
+            local envelope=body+min(3.5,max(1.25,moveSpeed*(latency()+min(0.1,state.tickGap or 0))))
+            for _,e in ipairs(rd.enemies or {}) do
+                local label=string.lower(tostring(e.model and e.model.Name or ""))
+                if not e.isBoss and alive(e) and label:find("knight",1,true) then
+                    local pos=e.root.Position
+                    local dx,dz=pos.X-origin.X,pos.Z-origin.Z
+                    local gap=sqrt(dx*dx+dz*dz)
+                    if gap<65 and abs(pos.Y-origin.Y)<16 then
+                        local vx,vz=tonumber(e.vx) or 0,tonumber(e.vz) or 0
+                        local speed=sqrt(vx*vx+vz*vz)
+                        if speed>34 then vx*=34/speed;vz*=34/speed;speed=34 end
+                        local rx,rz=vx-pv.X,vz-pv.Z
+                        local vv=rx*rx+rz*rz
+                        local closing=-(dx*rx+dz*rz)/max(gap,0.01)
+                        local eta=vv>0.01 and min(0.65,max(0,-(dx*rx+dz*rz)/vv)) or 0
+                        local nearest=sqrt((dx+rx*eta)^2+(dz+rz*eta)^2)
+                        local radius=19.5
+                        if gap<radius+envelope or closing>4 and eta>0 and nearest<radius+envelope then
+                            local zone={name="knight approach",spacing=true,advisory=true,enemy=e,
+                                cx=pos.X,cy=pos.Y,cz=pos.Z,r=radius,hy=10,from=now,untilAt=now+0.85,
+                                closest=nearest,cpaTime=eta,closing=closing}
+                            if speed>0.1 then
+                                zone.moving=true;zone.ox=pos.X;zone.oy=pos.Y;zone.oz=pos.Z
+                                zone.dx=vx/speed;zone.dz=vz/speed;zone.speed=speed
+                                zone.pathStart=now;zone.endAlong=speed*0.65
+                            end
+                            state.zones[#state.zones+1]=zone
+                            state.knightAlerts+=1;state.spaceCount+=1
+                            if not state.approachThreat or nearest<state.approachThreat.closest then
+                                state.approachThreat=zone
+                            end
+                        end
+                    end
+                end
+            end
+        end
     end
     local function risk(p,now,delta,reach,height,lead,ignoreSpacing,ignoreForecast)
         local total,strongest,strongestValue=0,nil,0
@@ -672,7 +732,7 @@ local function installMobReflex(context)
                 and (zone.anticipate and at>=zone.anticipate or at>=(zone.from or now)-lead) then
                 local d=depth(zone,p,at,height)+zoneReach(zone,reach)
                 if d>0 then
-                    local value=1+min(d,30)/30
+                    local value=zone.advisory and min(1.5,d/max(zone.r or 1,1)) or 1+min(d,30)/30
                     total+=value
                     if value>strongestValue then strongest,strongestValue=zone,value end
                 end
@@ -810,7 +870,7 @@ local function installMobReflex(context)
                 end
                 if hit then
                     if depth(zone,origin,now,height)+envelope<=0 then
-                        if not (zone.spacing and state.priorityPhysical) then cross+=1 end
+                        if not zone.advisory and not (zone.spacing and state.priorityPhysical) then cross+=1 end
                     elseif start>0.001 and not zone.spacing then missed+=1 end
                 end
             end
@@ -1097,6 +1157,7 @@ local function installMobReflex(context)
             state.characterRoot=root;state.characterHum=hum;state.characterAt=now
             state.lastRead=-math.huge;state.lastParts=-math.huge
             state.failedGoal=nil;state.progressPos=nil;state.progressAt=nil
+            state.planAt=nil;state.planOrigin=nil;state.attackExposure=nil;state.exposure=nil
         end
         collect(now,origin)
         local reach=playerReach(root,hum)
@@ -1125,6 +1186,11 @@ local function installMobReflex(context)
         state.spacingRisk=risk(origin,now,0,reach,height,lead)-physical
         local ahead,aheadZone=risk(origin+flat*lead,now,lead,reach,height,0.12,state.priorityPhysical)
         if ahead>baseline then baseline,strongest=ahead,aheadZone end
+        if not state.priorityPhysical and state.approachThreat and baseline<=0 then
+            local threat=state.approachThreat
+            baseline=1+min(30,max(0,threat.r+reach-threat.closest))/30
+            strongest=threat
+        end
         state.predictedRisk=baseline
         local reached=state.goal and distance(origin,state.goal)<2.5
         if baseline<=0 then
@@ -1196,7 +1262,7 @@ end
 -- Bounded local replay of movement decisions. No network requests or movement.
 local function installDodgeReports(context)
     local cfg,rt=context.CFG,context.RT
-    local report={frames={},deaths={},life=0,status="V23: recording dodge decisions",lastSample=-math.huge,
+    local report={frames={},deaths={},life=0,status="V24: recording dodge decisions",lastSample=-math.huge,
         lastCaption=-math.huge,path="DQR_GildedV10/logs/dodge_last_death.json"}
     context.dodgeReports=report
     if cfg.harvardDodgeReports==nil then cfg.harvardDodgeReports=true end
@@ -1217,7 +1283,7 @@ local function installDodgeReports(context)
         local frames,deaths={},{}
         for i,frame in ipairs(report.frames) do frames[i]=frame end
         for i,death in ipairs(report.deaths) do deaths[i]=death end
-        return {version="V23",reason=reason,at=now,place_id=game.PlaceId,
+        return {version="V24",reason=reason,at=now,place_id=game.PlaceId,
             class=cfg.classProfile,npc_assist=cfg.harvardMobDodge~=false,
             speed21=cfg.harvardSpeed21~=false,life=report.life,recent_deaths=deaths,frames=frames}
     end
@@ -1244,7 +1310,7 @@ local function installDodgeReports(context)
     end
     function context.harvardSaveDodgeReport()
         local ok,result=persist(latest())
-        report.status=ok and "V23: dodge report saved" or "V23: report save failed"
+        report.status=ok and "V24: dodge report saved" or "V24: report save failed"
         message("Dodge report",ok and ("Saved "..report.path) or tostring(result))
         return ok,result
     end
@@ -1263,7 +1329,7 @@ local function installDodgeReports(context)
         if now-report.lastCaption<0.5 then return end
         report.lastCaption=now
         local mob=context.mobDodge
-        local text=cfg.harvardDodgeReports==false and "V23: dodge recording OFF" or report.status
+        local text=cfg.harvardDodgeReports==false and "V24: dodge recording OFF" or report.status
         if mob then
             text=text.." | NPC: "..tostring(mob.mode).." | read/used "
                 ..tostring(mob.sourceCount or 0).."/"..tostring(mob.acceptedCount or 0)
@@ -1326,7 +1392,9 @@ local function installDodgeReports(context)
             physical_priority=mob and mob.priorityPhysical,spacing_risk=mob and finite(mob.spacingRisk),
             plan_origin=mob and vector(mob.planOrigin),plan_at=mob and finite(mob.planAt),
             exposure_actual=mob and finite(mob.attackExposure),
-            zones={},predictions={},keepouts={},wall_hits={},enemies={}}
+            knight_alerts=mob and mob.knightAlerts,
+            plan_age=mob and mob.planAt and finite(now-mob.planAt),
+            zones={},predictions={},keepouts={},warning_deadlines={},wall_hits={},enemies={}}
         for _,hit in ipairs(mob and mob.wallHits or {}) do
             if #frame.wall_hits>=8 then break end
             frame.wall_hits[#frame.wall_hits+1]={x=finite(hit.x),z=finite(hit.z),
@@ -1341,6 +1409,11 @@ local function installDodgeReports(context)
                 moving=zone.moving,from=finite(zone.from),until_at=finite(zone.untilAt)}
         end
         for _,zone in ipairs(mob and mob.zones or {}) do
+            if zone.warning and #frame.warning_deadlines<8 then
+                frame.warning_deadlines[#frame.warning_deadlines+1]={name=zone.name,x=finite(zone.cx),z=finite(zone.cz),
+                    r=finite(zone.r),reader_from=finite(zone.readerFrom),deadline=finite(zone.from),
+                    nominal_hit=finite(zone.impactAt),ground=zone.ground}
+            end
             if zone.forecast and #frame.predictions<8 then
                 frame.predictions[#frame.predictions+1]={name=zone.name,x=zone.cx,z=zone.cz,
                     source=zone.predictionSource,ax=zone.ax,az=zone.az,ha=zone.ha,hb=zone.hb,
@@ -1348,7 +1421,8 @@ local function installDodgeReports(context)
             end
             if zone.spacing and #frame.keepouts<8 then
                 frame.keepouts[#frame.keepouts+1]={name=zone.name,x=finite(zone.cx),z=finite(zone.cz),
-                    r=finite(zone.r),speed=finite(zone.speed),enemy=zone.enemy and zone.enemy.model and zone.enemy.model.Name}
+                    r=finite(zone.r),speed=finite(zone.speed),enemy=zone.enemy and zone.enemy.model and zone.enemy.model.Name,
+                    advisory=zone.advisory,closest=finite(zone.closest),cpa_time=finite(zone.cpaTime),closing=finite(zone.closing)}
             end
         end
         for _,enemy in ipairs(rd.enemies or {}) do
@@ -1382,8 +1456,8 @@ local function installDodgeReports(context)
             if #report.deaths>3 then table.remove(report.deaths,1) end
             report.lastDeath=build("death",now)
             local ok,result=persist(report.lastDeath)
-            report.status=ok and "V23: last death saved; Copy dodge report"
-                or "V23: last death buffered; Copy dodge report"
+            report.status=ok and "V24: last death saved; Copy dodge report"
+                or "V24: last death buffered; Copy dodge report"
             report.saveError=not ok and tostring(result) or nil
         end
     end
@@ -1391,7 +1465,7 @@ local function installDodgeReports(context)
     context.sliderConnections=context.sliderConnections or {}
     context.sliderConnections[#context.sliderConnections+1]=runService.Heartbeat:Connect(function()
         local ok,err=pcall(context.dodgeReportTick,os.clock())
-        if not ok then report.status="V23: report error";report.error=tostring(err) end
+        if not ok then report.status="V24: report error";report.error=tostring(err) end
     end)
 end
 
@@ -147472,7 +147546,7 @@ components.interfaceMainLoop = function(context)
         end, function(enabled)
             config.harvardMobDodge=enabled
             saveConfig()
-        end, 6, "Buffered escape handoff and shortest observed-attack exits before proximity preferences."))
+        end, 6, "Knight approach warnings, earlier circle exits and regular NPC steering."))
         helper(uiLibrary.toggle(runsThisAccount, "Speed 21 (experimental)", function()
             return config.harvardSpeed21 ~= false
         end, function(enabled)
@@ -147496,7 +147570,7 @@ components.interfaceMainLoop = function(context)
             "Copy the last death's movement report, or the current report if there has been no death.")
         dodgeReportRow.add("Save dodge report", "secondary", function() context.harvardSaveDodgeReport() end,
             "Save the report as DQR_GildedV10/logs/dodge_last_death.json in the executor workspace.")
-        context.dodgeReports.caption=uiLibrary.label(runsThisAccount,"V23: recording dodge decisions","captionSub",10)
+        context.dodgeReports.caption=uiLibrary.label(runsThisAccount,"V24: recording dodge decisions","captionSub",10)
         context.dodgeReports.caption.Size=UDim2.new(1,0,0,38)
         context.dodgeReports.caption.TextWrapped=true
         local persistenceRow = uiLibrary.buttonRow(runsThisAccount, 3)
@@ -166185,7 +166259,7 @@ local ok, reason = xpcall(function()
     for index, name in ipairs(order) do
         if stopped then return end
         currentStage = name
-        print(("[DQR Harvard V23] Loading %d/18: %s"):format(index, name))
+        print(("[DQR Harvard V24] Loading %d/18: %s"):format(index, name))
         components[name](context)
         if name == "movementCombat" then
             installBossRecoveryMovement(context)
@@ -166202,7 +166276,7 @@ local ok, reason = xpcall(function()
         task.wait()
     end
     if stopped then return end
-    context.INTEGRATION_VERSION = "V23 Harvard buffered attack exits"
+    context.INTEGRATION_VERSION = "V24 Harvard Knight approach and circle deadlines"
     context.harvardPersistence.refresh()
     pcall(context.saveConfig)
     local dungeon = context.Workspace:FindFirstChild("dungeonName")
@@ -166217,10 +166291,10 @@ local ok, reason = xpcall(function()
     if context.notify then
         context.notify("run", "Harvard ready", "Auto-start dungeon: " .. (context.CFG.autoStartDungeon ~= false and "ON" or "OFF") .. ". All controls are in this menu.")
     end
-    print("[DQR Harvard V23] Ready: Harvard menu only; auto-start " .. tostring(context.CFG.autoStartDungeon ~= false))
+    print("[DQR Harvard V24] Ready: Harvard menu only; auto-start " .. tostring(context.CFG.autoStartDungeon ~= false))
 end, function(err) return debug.traceback(tostring(err), 2) end)
 if not ok then
-    warn("[DQR Harvard V23] " .. currentStage .. ": " .. tostring(reason))
+    warn("[DQR Harvard V24] " .. currentStage .. ": " .. tostring(reason))
     stopHarvardEngine()
     pcall(function()
         getService("StarterGui"):SetCore("SendNotification", {
@@ -166243,8 +166317,8 @@ local cached, cacheError = pcall(function()
     assert(readfile(cachePath)==payload, "saved engine verification failed")
 end)
 env.DQRHarvardCacheReady = cached
-if not cached then warn("[DQR Harvard V23] Auto-execute cache unavailable: "..tostring(cacheError)) end
+if not cached then warn("[DQR Harvard V24] Auto-execute cache unavailable: "..tostring(cacheError)) end
 assert(type(loadstring)=="function", "Executor loadstring is required to run the bundled engine")
-local run, compileError = loadstring(payload,"@DQR_Harvard_V23")
+local run, compileError = loadstring(payload,"@DQR_Harvard_V24")
 assert(run,tostring(compileError))
 return run()
