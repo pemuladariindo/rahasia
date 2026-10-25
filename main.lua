@@ -1,13 +1,16 @@
 --[[
-DQR GILDED V26 - HARVARD / PACK FOCUS + EIF CAST WINDOW
+DQR GILDED V27 - HARVARD / EIF RECOVERY + NPC SPELL CASTS
 Run this complete file once. It saves its bundled engine in the executor's local
 workspace and runs it. No HTTP downloads or external code are used.
 
-Known area skills prefer reachable packs; single remaining enemies keep the original targeting.
+Ready EIF can satisfy a legacy opening wait instead of waiting behind it.
+NPC spell casts have a guarded recovery path while the existing movement controller steers.
+An unknown spell, including Jade Rain, can make a nearby initial cast before area measurement.
+No guessed Jade Rain dimensions or animation IDs are installed.
 EIF must be active with enough time left for the damage skill's windup and input delay.
 Cooldown timing expires independently of a lingering marker; late casts wait for the next buff.
 Boss casts use the same window. Deferred key retries expire and cannot cross buff cycles.
-The existing EIF gate is enabled once for this update; later user choices remain saved.
+Saved controls and the EIF windup window are retained. NPC recovery runs after hazard sensing.
 V24 dodge movement and the saved movement-speed choice are retained.
 Harvard > Autofarm:
 - Focus enemy packs / Require active EIF for damage (ON by default, saved per account)
@@ -32,7 +35,7 @@ local env = type(getgenv) == "function" and getgenv() or _G
 local payload = [=====[
 -- DQR_HARVARD_RUNTIME_V12
 --[[
-DQR HARVARD V26 RUNTIME
+DQR HARVARD V27 RUNTIME
 All 18 user-supplied reference components; Harvard menu only.
 Per-account save/load, autosave and teleport auto-execute are available in Autofarm.
 This local cached engine is installed by DQR_Gilded_V12_AutoExec.lua.
@@ -515,6 +518,7 @@ local function installHarvardCombatAssist(context)
             if tool and innerNames[slots[slot]] then
                 local cdValue=tool:FindFirstChild("cooldown")
                 local left=cdValue and validNumber(cdValue.Value)
+                if left and left<=0.0001 then left=0 end
                 if left~=nil then cooldown=min(cooldown or math.huge,max(left,0)) end
                 local lengthValue=tool:FindFirstChild("cooldownLength")
                 local declared=lengthValue and validNumber(lengthValue.Value)
@@ -909,6 +913,210 @@ local function installHarvardCombatAssist(context)
             rt.skillGate=why
         end
         return allowed
+    end
+end
+
+-- Recover the live EIF -> damage sequence without waiting for legacy opening timers.
+-- All keys still go through the shared cooldown, EIF, facing and dodge checks.
+local function installHarvardCombatRecovery(context)
+    local cfg,rt,rd=context.CFG,context.RT,context.RD
+    local state=context.harvardCombat
+    if not state then return end
+    state.deliveryAt={};state.buffInputs={};state.recovery="waiting"
+    local epsilon=0.0001
+    local inner={ ["inner focus"]=true,["enhanced inner focus"]=true,
+        ["inner rage"]=true,["enhanced inner rage"]=true }
+    local function name(value) return string.lower(tostring(value or "")):match("^%s*(.-)%s*$") end
+    local function kit()
+        local tools={}
+        local char=context.LocalPlayer.Character
+        if state.recoveryCharacter~=char then
+            state.recoveryCharacter=char;state.deliveryAt={};state.buffInputs={}
+            state.buffAttemptAt=nil;state.damageCheckAt=nil
+        end
+        for _,container in pairs({context.LocalPlayer.Backpack,char}) do
+            if container then for _,tool in ipairs(container:GetChildren()) do
+                if tool:IsA("Tool") then
+                    local marker=tool:FindFirstChild("abilitySlot")
+                    local key=marker and name(marker.Value)
+                    if key=="q" or key=="e" then tools[key]=tool end
+                end
+            end end
+        end
+        local buff,damage
+        for _,key in ipairs({"q","e"}) do
+            if tools[key] then
+                if inner[name(tools[key].Name)] then buff=key else damage=key end
+            end
+        end
+        state.buffSlot=buff;state.damageSlot=damage
+        if buff then
+            local value=tools[buff]:FindFirstChild("cooldown")
+            state.liveBuffCooldown=value and tonumber(value.Value)
+        end
+        if damage then
+            local value=tools[damage]:FindFirstChild("cooldown")
+            state.liveDamageCooldown=value and tonumber(value.Value)
+        end
+        return tools,buff,damage
+    end
+    local function left(tool)
+        local value=tool and tool:FindFirstChild("cooldown")
+        local n=value and tonumber(value.Value)
+        if n and n==n then return n<=epsilon and 0 or n end
+    end
+    local function readyCharacter(now)
+        if rt.destroyed or rt.modHalt or not rt.farmEnabled then return nil,"paused" end
+        local char,hum,root=context.character()
+        if not char or not root or not hum or hum.Health<=0 then return nil,"no character" end
+        if rt.swapHoldUntil and now<rt.swapHoldUntil then return nil,"loadout swap" end
+        if context.pinnedBy and context.pinnedBy(char) then return nil,"stunned" end
+        local busy=char:FindFirstChild("busyCasting")
+        if busy and busy.Value==true then return nil,"casting" end
+        if context.isAlt1186 and context.isAlt1186() then return nil,"leech role" end
+        return {char=char,hum=hum,root=root}
+    end
+    local function live(e)
+        return e and e.root and e.root.Parent and e.humanoid and e.humanoid.Health>0
+    end
+    local function localReady(slot,now)
+        local tools,buff=kit()
+        if not buff or not tools[slot] then return true end
+        local character,why=readyCharacter(now)
+        if not character then return false,why end
+        local cd=left(tools[slot])
+        if cd and cd>0 then return false,slot==buff and "EIF cooldown" or "damage cooldown" end
+        if now-(state.deliveryAt[slot] or -math.huge)<0.25 then return false,"waiting for cooldown confirmation" end
+        return true
+    end
+    local prepare,commit=context.harvardPrepareSkill,context.harvardCommitSkill
+    context.harvardPrepareSkill=function(slot,now)
+        local ok,why=localReady(slot,now)
+        if not ok then state.recovery=why;return false,why end
+        local allowed,reason,aim=prepare(slot,now)
+        if not allowed then return allowed,reason,aim end
+        local _,buff=kit()
+        if buff and slot~=buff and context.attackAllowedBySkill then
+            allowed,reason=context.attackAllowedBySkill(now)
+            if not allowed then state.recovery=reason;return false,reason end
+        end
+        return true,nil,aim
+    end
+    context.harvardCommitSkill=function(slot,now)
+        local ok,why=localReady(slot,now)
+        if not ok then state.recovery=why;return false,why end
+        local allowed,reason=commit(slot,now)
+        if allowed then
+            state.deliveryAt[slot]=now
+            local tools,buff=kit()
+            if slot==buff then
+                state.buffInputs[#state.buffInputs+1]={at=now,slot=slot,cooldown=left(tools[slot])}
+                while #state.buffInputs>8 do table.remove(state.buffInputs,1) end
+                state.recovery="EIF key requested"
+            else state.recovery="damage key requested" end
+        end
+        return allowed,reason
+    end
+    local oldSlotReady=context.slotReady
+    if oldSlotReady then context.slotReady=function(slot)
+        local tools,buff=kit()
+        if buff and tools[slot] then
+            local cd=left(tools[slot])
+            if cd~=nil then return cd==0 and localReady(slot,os.clock())==true end
+        end
+        return oldSlotReady(slot)
+    end end
+    local function visible(origin,e)
+        if not context.Workspace.Raycast or not context.raycastParams then return true end
+        local start=origin+Vector3.new(0,1,0)
+        local hit=context.Workspace:Raycast(start,e.root.Position+Vector3.new(0,1,0)-start,context.raycastParams())
+        if not hit then return true end
+        return hit.Instance and hit.Instance.IsDescendantOf and hit.Instance:IsDescendantOf(e.model) or false
+    end
+    local function targetAt(origin,limit,needVisible)
+        local target=context.BR and context.BR.target
+        local best,distance=nil,limit*limit
+        for _,e in ipairs(rd.enemies or {}) do
+            if live(e) and math.abs(e.root.Position.Y-origin.Y)<16 and (not needVisible or visible(origin,e)) then
+                local p=e.root.Position
+                local d=(p.X-origin.X)^2+(p.Z-origin.Z)^2
+                if d<distance then best,distance=e,d end
+            end
+        end
+        if live(target) then
+            local p=target.root.Position
+            local d=(p.X-origin.X)^2+(p.Z-origin.Z)^2
+            if d<=distance+4 and d<=limit*limit and (not needVisible or visible(origin,target)) then best=target end
+        end
+        return best
+    end
+    local oldPress=context.buffPress
+    context.buffPress=function(now)
+        now=now or os.clock()
+        local tools,buff=kit()
+        if not buff or not context.harvardPressAbility then return oldPress and oldPress(now) or false end
+        local character,why=readyCharacter(now)
+        if not character then state.recovery=why;return false end
+        local phase=context.buffState(now)
+        if phase~="ready" then state.recovery=phase=="up" and "EIF active" or "waiting for EIF cooldown";return false end
+        if left(tools[buff]) and left(tools[buff])>0 then return false end
+        if now-(state.buffAttemptAt or -math.huge)<0.5 then return false end
+        if context.gsStartHold and context.gsStartHold(now) then state.recovery="spawn barrier";return false end
+        local reach=(context.fireReach and context.fireReach() or 60)+25
+        if not targetAt(character.root.Position,reach) then state.recovery="no nearby enemy";return false end
+        state.buffAttemptAt=now
+        local key=buff=="q" and Enum.KeyCode.Q or Enum.KeyCode.E
+        local sent=context.harvardPressAbility(key)
+        state.recovery=sent and "EIF key requested" or tostring(rt.skillGate or "EIF input held")
+        return sent==true
+    end
+    local tick=context.buffTick
+    context.buffTick=function(now)
+        local tools,buff,damage=kit()
+        context.harvardNPCRecoveryOwns=buff~=nil and damage~=nil and cfg.classProfile=="mage"
+            and cfg[damage=="q" and "autoQ" or "autoE"]~=false and rt.farmEnabled and not rt.destroyed
+            and (not context.harvardInGilded or context.harvardInGilded(now)) or false
+        if tick then
+            local ok,err=pcall(tick,now)
+            if not ok then rt.lastError="Legacy buff tick: "..tostring(err);rt.lastErrorAt=now end
+        end
+        if not buff then return end
+        local character,why=readyCharacter(now)
+        if not character then state.recovery=why;return end
+        if context.buffState(now)=="ready" then
+            -- Original buffTick waits on firstCastWaitAt. A ready EIF must be
+            -- allowed to satisfy that opening wait instead of depending on it.
+            context.buffPress(now)
+            return
+        end
+    end
+    -- Called after this frame's movement/hazard sensing, not before it.
+    context.harvardCombatRecoveryTick=function(now)
+        local tools,buff,damage=kit()
+        if not buff then return end
+        local character,why=readyCharacter(now)
+        if not character then state.recovery=why;return end
+        if not damage or cfg.classProfile~="mage" or not context.harvardTryNPCSpell then return end
+        if not context.harvardNPCRecoveryOwns then return end
+        if cfg[damage=="q" and "autoQ" or "autoE"]==false then state.recovery="damage skill OFF";return end
+        if now-(state.damageCheckAt or -math.huge)<0.08 then return end
+        state.damageCheckAt=now
+        local allowed,reason=context.attackAllowedBySkill(now)
+        if not allowed then state.recovery=reason;return end
+        if not context.slotReady(damage) then state.recovery="damage cooldown";return end
+        local measured=rd.abilitySlots and rd.abilitySlots[damage]
+        local known=type(cfg.aoeKnown)=="table" and cfg.aoeKnown[name(tools[damage].Name)]
+        local observed=measured and measured.measured and measured.aoeX and measured.aoeZ
+        local reach=context.fireReach and context.fireReach() or 40
+        -- An unknown spell gets an initial nearby cast. Its real projectile
+        -- measurement can then supply the pack footprint; no dimensions are invented.
+        if not known and not observed then reach=math.min(reach,40) end
+        state.footprintSource=known and "known area" or observed and "measured area" or "initial nearby cast"
+        local target=targetAt(character.root.Position,reach,true)
+        if not target then state.recovery="target outside spell reach";return end
+        if target.isBoss then state.recovery="original boss caster";return end
+        local success,stage=context.harvardTryNPCSpell(damage,target,now)
+        state.recovery=success and "damage key requested" or tostring(stage or "aligning damage")
     end
 end
 
@@ -1820,7 +2028,7 @@ end
 -- Bounded local replay of movement decisions. No network requests or movement.
 local function installDodgeReports(context)
     local cfg,rt=context.CFG,context.RT
-    local report={frames={},deaths={},life=0,status="V26: recording dodge decisions",lastSample=-math.huge,
+    local report={frames={},deaths={},life=0,status="V27: recording dodge decisions",lastSample=-math.huge,
         lastCaption=-math.huge,path="DQR_GildedV10/logs/dodge_last_death.json"}
     context.dodgeReports=report
     if cfg.harvardDodgeReports==nil then cfg.harvardDodgeReports=true end
@@ -1841,7 +2049,7 @@ local function installDodgeReports(context)
         local frames,deaths={},{}
         for i,frame in ipairs(report.frames) do frames[i]=frame end
         for i,death in ipairs(report.deaths) do deaths[i]=death end
-        return {version="V26",reason=reason,at=now,place_id=game.PlaceId,
+        return {version="V27",reason=reason,at=now,place_id=game.PlaceId,
             class=cfg.classProfile,npc_assist=cfg.harvardMobDodge~=false,
             speed21=cfg.harvardSpeed21~=false,pack_focus=cfg.harvardPackFocus~=false,
             strict_eif=cfg.harvardStrictEIF~=false,life=report.life,recent_deaths=deaths,frames=frames}
@@ -1869,7 +2077,7 @@ local function installDodgeReports(context)
     end
     function context.harvardSaveDodgeReport()
         local ok,result=persist(latest())
-        report.status=ok and "V26: dodge report saved" or "V26: report save failed"
+        report.status=ok and "V27: dodge report saved" or "V27: report save failed"
         message("Dodge report",ok and ("Saved "..report.path) or tostring(result))
         return ok,result
     end
@@ -1888,14 +2096,14 @@ local function installDodgeReports(context)
         if now-report.lastCaption<0.5 then return end
         report.lastCaption=now
         local mob=context.mobDodge
-        local text=cfg.harvardDodgeReports==false and "V26: dodge recording OFF" or report.status
+        local text=cfg.harvardDodgeReports==false and "V27: dodge recording OFF" or report.status
         if mob then
             text=text.." | NPC: "..tostring(mob.mode).." | read/used "
                 ..tostring(mob.sourceCount or 0).."/"..tostring(mob.acceptedCount or 0)
         end
         local combat=context.harvardCombat
         if combat then
-            text=text.."\nEIF: "..tostring(combat.eifReason or "waiting")
+            text=text.."\nCombat: "..tostring(combat.recovery or "waiting").." | EIF: "..tostring(combat.eifReason or "waiting")
                 ..(" | %.1fs left / %.1fs needed"):format(combat.eifRemaining or 0,combat.eifNeeded or 0)
         end
         if report.caption and report.caption.Parent then report.caption.Text=text end
@@ -1972,7 +2180,15 @@ local function installDodgeReports(context)
             pack_hits=combat and combat.hits,pack_total=combat and combat.total,
             pack_previous_hits=combat and combat.previousHits,pack_aim=combat and vector(combat.aim),
             pack_plan_at=combat and finite(combat.planAt),pack_skill=combat and combat.skill,
-            zones={},predictions={},keepouts={},warning_deadlines={},wall_hits={},enemies={},skill_requests={}} 
+            npc_cast_owner=context.harvardNPCRecoveryOwns,combat_recovery=combat and combat.recovery,buff_slot=combat and combat.buffSlot,
+            damage_slot=combat and combat.damageSlot,buff_cd_live=combat and finite(combat.liveBuffCooldown),
+            damage_cd_live=combat and finite(combat.liveDamageCooldown),footprint_source=combat and combat.footprintSource,
+            first_cast_wait_age=rt.firstCastWaitAt and finite(now-rt.firstCastWaitAt),
+            auto_q=cfg.autoQ,auto_e=cfg.autoE,
+            zones={},predictions={},keepouts={},warning_deadlines={},wall_hits={},enemies={},skill_requests={},buff_inputs={}} 
+        for _,request in ipairs(combat and combat.buffInputs or {}) do
+            frame.buff_inputs[#frame.buff_inputs+1]={at=finite(request.at),slot=request.slot,cooldown=finite(request.cooldown)}
+        end
         for _,request in ipairs(combat and combat.casts or {}) do
             frame.skill_requests[#frame.skill_requests+1]={at=finite(request.at),slot=request.slot,
                 skill=request.skill,buff=finite(request.buff),confirmed=request.confirmed,required=request.required,
@@ -2042,8 +2258,8 @@ local function installDodgeReports(context)
             if #report.deaths>3 then table.remove(report.deaths,1) end
             report.lastDeath=build("death",now)
             local ok,result=persist(report.lastDeath)
-            report.status=ok and "V26: last death saved; Copy dodge report"
-                or "V26: last death buffered; Copy dodge report"
+            report.status=ok and "V27: last death saved; Copy dodge report"
+                or "V27: last death buffered; Copy dodge report"
             report.saveError=not ok and tostring(result) or nil
         end
     end
@@ -2051,7 +2267,7 @@ local function installDodgeReports(context)
     context.sliderConnections=context.sliderConnections or {}
     context.sliderConnections[#context.sliderConnections+1]=runService.Heartbeat:Connect(function()
         local ok,err=pcall(context.dodgeReportTick,os.clock())
-        if not ok then report.status="V26: report error";report.error=tostring(err) end
+        if not ok then report.status="V27: report error";report.error=tostring(err) end
     end)
 end
 
@@ -70980,7 +71196,7 @@ components.movementCombat = function(context)
             return false
         end
         if argument == Enum.KeyCode.Q or argument == Enum.KeyCode.E then
-            if context.gsOpenerHold then
+            if context.gsOpenerHold and not context.harvardNPCSpellInFlight then
                 if not (context.gsIsBuffKey and context.gsIsBuffKey(argument)) then
                     if
                         not (
@@ -73250,6 +73466,7 @@ components.movementCombat = function(context)
         return value18
     end
     local function helper46(argument, argument2, argument3, argument4, argument5, skillGate)
+        if context.harvardNPCRecoveryOwns and argument3 and not argument3.isBoss then return false end
         local value = {}
         local pos = argument2.Position
         local value2, value3 = argument5 ~= nil
@@ -73599,6 +73816,7 @@ components.movementCombat = function(context)
         end
     end
     local function helper47(argument, argument2, hereCastAt, argument3)
+        if context.harvardNPCRecoveryOwns and hereCastAt and not hereCastAt.isBoss then return end
         local value = {}
         if context.isAlt1186() then
             return
@@ -118553,6 +118771,50 @@ components.movementCombat = function(context)
                 helper(argument, false)
             end
         end
+    context.harvardPressAbility=helper42
+    context.harvardTryNPCSpell=function(slot,target,now)
+        if not target or target.isBoss or not target.root or not target.root.Parent
+            or not target.humanoid or target.humanoid.Health<=0 then return false,"no live NPC" end
+        local char,hum,root=context.character()
+        if not hum or hum.Health<=0 or not root or not capturedContext[2].farmEnabled
+            or capturedContext[2].destroyed or capturedContext[2].modHalt then return false,"paused" end
+        if isCasting() then return false,"casting" end
+        if context.isBuffSlot(slot) then return false,"buff slot" end
+        if context.partyGroupWait and context.partyGroupWait(target,now) then return false,"waiting for party" end
+        if context.BB and context.BB.lethal and not (context.mobDodge and context.mobDodge.active) then
+            return false,"unsafe cast position"
+        end
+        local allowed,reason=context.attackAllowedBySkill(now)
+        if not allowed then return false,reason end
+        if not context.slotReady(slot) then return false,"damage cooldown" end
+        if not context.engageReady(root.Position,target) then return false,"target outside spell reach" end
+        local aim=target.root.Position
+        local point=context.harvardPackAim and context.harvardPackAim(root.Position,aim,slot,now)
+        if point then aim=point end
+        if not helper15(root,hum,aim,now) then return false,"aligning damage" end
+        local tag=context.tagOnCast and context.tagOnCast({target.model},now)
+        lockOnPress(root,aim)
+        local prior=context.harvardNPCSpellInFlight
+        context.harvardNPCSpellInFlight=true
+        local ok,sent=pcall(helper42,slot=="q" and Enum.KeyCode.Q or Enum.KeyCode.E)
+        context.harvardNPCSpellInFlight=prior
+        if not ok then error(sent,0) end
+        if not sent then
+            -- lockOnPress records a provisional facing lock before delivery.
+            -- A held input must not masquerade as an ongoing spell windup.
+            local face=capturedContext[2].castFace
+            if face and face.pressedAt and math.abs(face.pressedAt-now)<0.05 then face.pressedAt=nil end
+            if context.tagOnCastDrop then context.tagOnCastDrop(tag) end
+            return false,capturedContext[2].skillGate or "damage input held"
+        end
+        capturedContext[2][slot=="q" and "lastQ" or "lastE"]=now
+        capturedContext[2].castQueue=capturedContext[2].castQueue or {}
+        table.insert(capturedContext[2].castQueue,{slot=slot,at=now,pos=root.Position,targetPos=aim})
+        while #capturedContext[2].castQueue>4 do table.remove(capturedContext[2].castQueue,1) end
+        if context.noteCastRange then context.noteCastRange(slot,now,root.Position,target.humanoid,aim) end
+        return true
+    end
+
     -- Pure normal-speed steering for the non-boss reflex planner. It reuses
     -- this controller's input ownership instead of starting another move loop.
     context.mobReflexDrive = function(humanoid,root,goal,now)
@@ -148208,8 +148470,8 @@ components.interfaceMainLoop = function(context)
             "Copy the last death's movement report, or the current report if there has been no death.")
         dodgeReportRow.add("Save dodge report", "secondary", function() context.harvardSaveDodgeReport() end,
             "Save the report as DQR_GildedV10/logs/dodge_last_death.json in the executor workspace.")
-        context.dodgeReports.caption=uiLibrary.label(runsThisAccount,"V26: recording dodge decisions","captionSub",10)
-        context.dodgeReports.caption.Size=UDim2.new(1,0,0,68)
+        context.dodgeReports.caption=uiLibrary.label(runsThisAccount,"V27: recording dodge decisions","captionSub",10)
+        context.dodgeReports.caption.Size=UDim2.new(1,0,0,88)
         context.dodgeReports.caption.TextWrapped=true
         local persistenceRow = uiLibrary.buttonRow(runsThisAccount, 3)
         persistenceRow.add("Save config now", "accent", function() context.harvardSaveNow() end,
@@ -166797,6 +167059,9 @@ components.interfaceMainLoop = function(context)
         helper233("range", context.judgeCasts, value)
         helper233("buffs", context.buffTick, value)
         helper233("brain", helper235, value)
+        if context.harvardCombatRecoveryTick then
+            helper233("combat recovery", context.harvardCombatRecoveryTick, value)
+        end
         helper233("caster", context.casterTick, value)
         helper233("face", context.faceTick, value)
         runtimeState.econN = (runtimeState.econN or 0) + 1
@@ -166897,12 +167162,13 @@ local ok, reason = xpcall(function()
     for index, name in ipairs(order) do
         if stopped then return end
         currentStage = name
-        print(("[DQR Harvard V26] Loading %d/18: %s"):format(index, name))
+        print(("[DQR Harvard V27] Loading %d/18: %s"):format(index, name))
         components[name](context)
         if name == "movementCombat" then
             installBossRecoveryMovement(context)
             installHarvardCombatAssist(context)
             installMobReflex(context)
+            installHarvardCombatRecovery(context)
             installDodgeReports(context)
         end
         if name == "coreSettings" then
@@ -166915,7 +167181,7 @@ local ok, reason = xpcall(function()
         task.wait()
     end
     if stopped then return end
-    context.INTEGRATION_VERSION = "V26 Harvard EIF windup window and expiring input permits"
+    context.INTEGRATION_VERSION = "V27 Harvard live EIF recovery and nearby NPC spell casts"
     context.harvardPersistence.refresh()
     pcall(context.saveConfig)
     local dungeon = context.Workspace:FindFirstChild("dungeonName")
@@ -166930,10 +167196,10 @@ local ok, reason = xpcall(function()
     if context.notify then
         context.notify("run", "Harvard ready", "Auto-start dungeon: " .. (context.CFG.autoStartDungeon ~= false and "ON" or "OFF") .. ". All controls are in this menu.")
     end
-    print("[DQR Harvard V26] Ready: Harvard menu only; auto-start " .. tostring(context.CFG.autoStartDungeon ~= false))
+    print("[DQR Harvard V27] Ready: Harvard menu only; auto-start " .. tostring(context.CFG.autoStartDungeon ~= false))
 end, function(err) return debug.traceback(tostring(err), 2) end)
 if not ok then
-    warn("[DQR Harvard V26] " .. currentStage .. ": " .. tostring(reason))
+    warn("[DQR Harvard V27] " .. currentStage .. ": " .. tostring(reason))
     stopHarvardEngine()
     pcall(function()
         getService("StarterGui"):SetCore("SendNotification", {
@@ -166956,8 +167222,8 @@ local cached, cacheError = pcall(function()
     assert(readfile(cachePath)==payload, "saved engine verification failed")
 end)
 env.DQRHarvardCacheReady = cached
-if not cached then warn("[DQR Harvard V26] Auto-execute cache unavailable: "..tostring(cacheError)) end
+if not cached then warn("[DQR Harvard V27] Auto-execute cache unavailable: "..tostring(cacheError)) end
 assert(type(loadstring)=="function", "Executor loadstring is required to run the bundled engine")
-local run, compileError = loadstring(payload,"@DQR_Harvard_V26")
+local run, compileError = loadstring(payload,"@DQR_Harvard_V27")
 assert(run,tostring(compileError))
 return run()
