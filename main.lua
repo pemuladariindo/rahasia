@@ -1,11 +1,13 @@
 --[[
-DQR GILDED V25 - HARVARD / PACK FOCUS + CONFIRMED EIF
+DQR GILDED V26 - HARVARD / PACK FOCUS + EIF CAST WINDOW
 Run this complete file once. It saves its bundled engine in the executor's local
 workspace and runs it. No HTTP downloads or external code are used.
 
 Known area skills prefer reachable packs; single remaining enemies keep the original targeting.
-Damage skills require an active spellBuff when EIF/Inner Rage is equipped.
-Buff confirmation is repeated immediately before key delivery, including boss casts.
+EIF must be active with enough time left for the damage skill's windup and input delay.
+Cooldown timing expires independently of a lingering marker; late casts wait for the next buff.
+Boss casts use the same window. Deferred key retries expire and cannot cross buff cycles.
+The existing EIF gate is enabled once for this update; later user choices remain saved.
 V24 dodge movement and the saved movement-speed choice are retained.
 Harvard > Autofarm:
 - Focus enemy packs / Require active EIF for damage (ON by default, saved per account)
@@ -30,7 +32,7 @@ local env = type(getgenv) == "function" and getgenv() or _G
 local payload = [=====[
 -- DQR_HARVARD_RUNTIME_V12
 --[[
-DQR HARVARD V25 RUNTIME
+DQR HARVARD V26 RUNTIME
 All 18 user-supplied reference components; Harvard menu only.
 Per-account save/load, autosave and teleport auto-execute are available in Autofarm.
 This local cached engine is installed by DQR_Gilded_V12_AutoExec.lua.
@@ -366,6 +368,13 @@ local function installHarvardCombatAssist(context)
         for _,saved in ipairs(context.PERSIST or {}) do if saved==key then found=true;break end end
         if not found then table.insert(context.PERSIST,key) end
     end
+    if cfg.harvardEIFWindowV26~=true then
+        cfg.harvardStrictEIF=true
+        cfg.harvardEIFWindowV26=true
+    end
+    local foundWindow=false
+    for _,key in ipairs(context.PERSIST or {}) do if key=="harvardEIFWindowV26" then foundWindow=true end end
+    if not foundWindow then table.insert(context.PERSIST,"harvardEIFWindowV26") end
     local abs,min,max,sqrt=math.abs,math.min,math.max,math.sqrt
     local innerNames={ ["inner focus"]=true,["enhanced inner focus"]=true,
         ["inner rage"]=true,["enhanced inner rage"]=true }
@@ -475,68 +484,217 @@ local function installHarvardCombatAssist(context)
         end
         return oldFlag or false,oldButton
     end
+    -- The marker is an effect indicator, never a countdown. A separate, bounded
+    -- cooldown clock must leave enough time for the damage skill to wind up.
     local oldState,oldUp,oldGsUp=context.buffState,context.buffUp,context.gsSpeedUp
+    local observations=setmetatable({}, {__mode="k"})
+    local clockCharacter,clockHum,clockHealth
+    local cycleSerial=0
+    local learnedDuration={}
+    state.permits={}
+    state.buffRequests={}
+    local function resetClock(character,hum)
+        observations=setmetatable({}, {__mode="k"})
+        clockCharacter,clockHum,clockHealth=character,hum,hum and hum.Health
+        state.permits={};state.eifCycle=nil;state.eifUntil=nil;state.eifRemaining=nil
+        state.eifTimingSource=nil;state.lastEffect=nil
+        state.casts={};state.buffRequests={};state.preparedAt=nil;state.targetCache=nil
+    end
+    local function sampleWindow(now)
+        local slots,tools,required,innerSlot,character=loadout()
+        local hum=character and character:FindFirstChildOfClass("Humanoid")
+        if character~=clockCharacter or hum~=clockHum or hum and clockHealth and clockHealth<=0 and hum.Health>0 then
+            resetClock(character,hum)
+        end
+        clockHealth=hum and hum.Health
+        local rawActive,amount,present=effect()
+        local healthy=hum and hum.Health>0
+        local best,anyReady,cooldown=nil,false,nil
+        for _,slot in ipairs({"q","e"}) do
+            local tool=tools[slot]
+            if tool and innerNames[slots[slot]] then
+                local cdValue=tool:FindFirstChild("cooldown")
+                local left=cdValue and validNumber(cdValue.Value)
+                if left~=nil then cooldown=min(cooldown or math.huge,max(left,0)) end
+                local lengthValue=tool:FindFirstChild("cooldownLength")
+                local declared=lengthValue and validNumber(lengthValue.Value)
+                if declared and declared<=0 then declared=nil end
+                local obs=observations[tool]
+                if not obs then obs={};observations[tool]=obs end
+                local duration=min(validNumber(cfg.buffDuration) or 5,learnedDuration[slots[slot]] or math.huge)
+                duration=max(0.1,duration)
+                local reset=left and obs.left and left>obs.left+0.3 and obs.left<=0.35
+                local restarted=left and obs.left and left>obs.left+0.5 and now-(obs.castAt or -math.huge)>1
+                if reset or restarted then
+                    -- The cooldown actually moved. A key press by itself is not a cast.
+                    obs.full=max(declared or validNumber(cfg.buffCooldown) or 6,left)
+                    obs.castAt=now-max(obs.full-left,0)
+                    obs.fresh=reset==true;obs.endsAt=obs.castAt+duration
+                    cycleSerial+=1;obs.cycle=cycleSerial;obs.source="observed cooldown reset"
+                elseif not obs.cycle and left and left>0 then
+                    local full=declared or validNumber(cfg.buffCooldown) or 6
+                    if left<=full+0.1 then
+                        obs.full=full;obs.castAt=now-max(full-left,0)
+                        obs.endsAt=obs.castAt+duration;obs.fresh=false
+                        cycleSerial+=1;obs.cycle=cycleSerial;obs.source="cooldown age at attach"
+                    end
+                elseif left==nil and not obs.cycle and rawActive and obs.lastActive==false then
+                    local request=state.buffRequests[slot]
+                    if request and request.tool==tool and now-request.at<=0.8 then
+                        obs.castAt=request.at;obs.endsAt=request.at+duration;obs.fresh=true;obs.revoked=false
+                        cycleSerial+=1;obs.cycle=cycleSerial;obs.source="buff input and marker edge"
+                    end
+                end
+                if left~=nil then
+                    anyReady=anyReady or left<=0
+                    if left<=0 then
+                        obs.endsAt=nil;obs.castAt=nil;obs.cycle=nil;obs.fresh=false
+                    elseif obs.endsAt then
+                        local full=declared or obs.full or validNumber(cfg.buffCooldown) or 6
+                        local estimate=now+max(left-(full-duration),0)
+                        -- A frozen/lagging cooldown must not extend the same buff forever.
+                        obs.endsAt=min(obs.endsAt,estimate)
+                    end
+                elseif not rawActive and (not obs.endsAt or obs.endsAt<=now) then
+                    anyReady=true
+                    obs.cycle=nil;obs.endsAt=nil
+                end
+                if healthy and obs.fresh and obs.lastActive==true and not rawActive and obs.lastActiveAt and obs.castAt then
+                    local measured=obs.lastActiveAt-obs.castAt-0.1
+                    if measured>=0.75 and measured<=duration then
+                        learnedDuration[slots[slot]]=min(learnedDuration[slots[slot]] or duration,measured)
+                        duration=min(duration,measured)
+                    end
+                end
+                -- Disappearance of the marker revokes this cycle; a delayed visual
+                -- reappearing cannot reopen the old damage window.
+                if obs.lastActive==true and not rawActive then obs.revoked=true end
+                if reset or restarted then obs.revoked=false end
+                if not healthy then obs.endsAt=nil;obs.revoked=true end
+                if rawActive then obs.lastActiveAt=now end
+                obs.lastActive=rawActive;obs.left=left;obs.sampleAt=now
+                if obs.endsAt then obs.endsAt=min(obs.endsAt,(obs.castAt or now)+duration) end
+                if obs.endsAt and not obs.revoked and (not best or obs.endsAt>best.endsAt) then
+                    best={endsAt=obs.endsAt,cycle=obs.cycle,source=obs.source,slot=slot,castAt=obs.castAt}
+                end
+            end
+        end
+        local remaining=best and max(0,best.endsAt-now) or 0
+        local active=healthy and rawActive and best~=nil and remaining>0 or false
+        state.eifRequired=required;state.eifActive=active;state.eifMarkerActive=rawActive
+        state.eifValue=amount;state.markerPresent=present;state.eifAt=now;state.slots=slots
+        state.eifUntil=best and best.endsAt;state.eifRemaining=remaining
+        state.eifCycle=best and best.cycle;state.eifTimingSource=best and best.source
+        state.eifCastAt=best and best.castAt
+        local phase=active and "up" or anyReady and "ready" or required and "gap" or "none"
+        state.cooldownPhase=phase;state.cooldownLeft=cooldown
+        return {slots=slots,tools=tools,required=required,slot=best and best.slot or innerSlot,
+            character=character,hum=hum,active=active,rawActive=rawActive,present=present,
+            remaining=remaining,endsAt=best and best.endsAt,cycle=best and best.cycle,
+            phase=phase,ready=anyReady,cooldown=cooldown}
+    end
+    local function castBudget(slot,sample)
+        local name=slot and sample.slots[slot]
+        local windup=slot and context.spellWindup and validNumber(context.spellWindup(slot))
+        if not windup and slot then
+            windup=type(cfg.spellWindup)=="table" and validNumber(cfg.spellWindup[name])
+                or context.SPELL_WINDUP and validNumber(context.SPELL_WINDUP[name])
+        end
+        windup=windup or validNumber(cfg.castWindupMax) or 1.3
+        windup=max(windup,validNumber(cfg.castWindupMin) or 0.75,validNumber(cfg.castRootTime) or 0.7)
+        local ping=max(validNumber(rt.pingS) or 0,validNumber(rt.dataPingS) or 0)
+        local delay=slot and state.startDelays and state.startDelays[slot] or 0
+        local frame=min(0.2,max(0.03,state.sampleGap or 0))
+        -- Existing projectile lead is additional margin, not a verified server hit timestamp.
+        local lead=name and (type(cfg.spellLead)=="table" and validNumber(cfg.spellLead[name])
+            or context.SPELL_LEAD and validNumber(context.SPELL_LEAD[name])) or 0
+        return windup+max(0,lead or 0)+max(ping*2,delay)+frame+0.15
+    end
+    local function confirmed(now,slot,requireWindow)
+        local sample=sampleWindow(now)
+        state.eifNeeded=nil
+        if cfg.harvardStrictEIF==false then state.eifReason="EIF gate OFF";return true,nil,sample end
+        if slot and buffSlot(slot,sample.slots) then state.eifReason="buff key allowed";return true,nil,sample end
+        if not sample.required then
+            if not next(sample.slots) then state.eifReason="loadout pending";return false,"loadout pending",sample end
+            state.eifReason="no EIF equipped";return true,nil,sample
+        end
+        if not sample.hum or sample.hum.Health<=0 then state.eifReason="no character";return false,"no character",sample end
+        if not sample.active then
+            local reason=not sample.rawActive and (sample.present and "EIF inactive" or "EIF marker pending")
+                or sample.endsAt and "EIF timing expired" or "EIF timing unconfirmed"
+            state.eifReason=reason
+            return false,sample.ready and "ready" or reason,sample
+        end
+        if requireWindow then
+            local needed=0
+            if slot then needed=castBudget(slot,sample)
+            else
+                for _,candidate in ipairs({"q","e"}) do
+                    if sample.slots[candidate] and not buffSlot(candidate,sample.slots) then
+                        needed=max(needed,castBudget(candidate,sample))
+                    end
+                end
+            end
+            state.eifNeeded=needed
+            if sample.remaining<=needed then
+                state.eifReason="EIF ending - wait next buff"
+                return false,"EIF ending",sample
+            end
+        end
+        state.eifReason="confirmed EIF cast window"
+        return true,nil,sample
+    end
     context.buffState=function(now)
         now=now or os.clock()
-        local phase,slot,left=oldState(now)
-        state.cooldownPhase=phase;state.cooldownLeft=left
-        local _,tools,required,innerSlot=loadout()
-        if cfg.harvardStrictEIF==false or not scope(now) or not required then return phase,slot,left end
-        local active=effect()
-        if active then return "up",innerSlot,phase=="up" and left or 0 end
-        local tool=tools[innerSlot]
-        local cd=tool and tool:FindFirstChild("cooldown")
-        local remaining=cd and validNumber(cd.Value)
-        if remaining~=nil then
-            return remaining>0 and "gap" or "ready",innerSlot,max(remaining,0)
-        end
-        -- Cooldown-inferred "up" is not confirmation that EIF is currently active.
-        if phase=="up" or phase=="gap" then return "gap",innerSlot,left or 0 end
-        return "ready",innerSlot,0
+        local sample=sampleWindow(now)
+        if cfg.harvardStrictEIF==false or not sample.required then return oldState(now) end
+        return sample.phase,sample.slot,sample.phase=="gap" and (sample.cooldown or 0) or sample.remaining
     end
     context.buffUp=function(now)
-        now=now or os.clock()
-        local _,_,required=loadout()
-        if cfg.harvardStrictEIF~=false and scope(now or os.clock()) and required then
-            local active=effect()
-            rt.buffUpUntil=active and (now or os.clock())+0.1 or 0
-            return active
+        local sample=sampleWindow(now or os.clock())
+        if cfg.harvardStrictEIF~=false and sample.required then
+            rt.buffUpUntil=sample.active and sample.endsAt or 0
+            return sample.active
         end
-        return oldUp and oldUp(now) or false
+        return oldUp and oldUp(now or os.clock()) or false
     end
     context.gsSpeedUp=function()
-        local _,_,required=loadout()
-        if cfg.harvardStrictEIF~=false and scope(os.clock()) and required then return effect() end
+        local sample=sampleWindow(os.clock())
+        if cfg.harvardStrictEIF~=false and sample.required then return sample.active end
         if oldGsUp then return oldGsUp() end
         return true
-    end
-    local function confirmed(now,slot)
-        local slots,_,required,_,character=loadout()
-        local active,amount,present=effect()
-        state.eifRequired=required;state.eifActive=active;state.eifValue=amount;state.markerPresent=present
-        state.eifAt=now;state.slots=slots
-        if cfg.harvardStrictEIF==false or not scope(now) or slot and buffSlot(slot,slots) then return true end
-        if not required then
-            if not next(slots) then state.eifReason="loadout pending";return false,"loadout pending" end
-            state.eifReason="no EIF equipped";return true
-        end
-        local hum=character and character:FindFirstChildOfClass("Humanoid")
-        if not hum or hum.Health<=0 then state.eifReason="no character";return false,"no character" end
-        if active then state.eifReason="confirmed spellBuff";return true end
-        local phase=context.buffState(now)
-        state.eifReason=present and "EIF inactive" or "EIF marker pending"
-        return false,phase=="ready" and "ready" or state.eifReason
     end
     local oldAllowed=context.attackAllowedBySkill
     context.attackAllowedBySkill=function(now)
         now=now or os.clock()
-        local allowed,why=confirmed(now)
+        local allowed,why=confirmed(now,nil,true)
         if not allowed then rt.skillGate=why;return false,why end
         if oldAllowed then return oldAllowed(now) end
         return true,"confirmed"
     end
     function context.harvardCombatSample(now)
-        confirmed(now)
+        local prior=state.windowSampleAt
+        if prior and now>prior then state.sampleGap=min(0.2,now-prior) end
+        state.windowSampleAt=now
+        confirmed(now,nil,true)
+    end
+    function context.harvardObserveSkillStart(slot,pressedAt,startedAt)
+        if rt.destroyed then return end
+        local sample=sampleWindow(startedAt)
+        for i=#state.casts,1,-1 do
+            local request=state.casts[i]
+            if request.slot==slot and abs(request.at-pressedAt)<0.15 then
+                request.startedAt=startedAt;request.buffAtStart=state.eifValue
+                request.activeAtStart=sample.active;request.leftAtStart=sample.remaining
+                request.delay=max(0,startedAt-pressedAt)
+                if request.delay<=1.5 then
+                    state.startDelays=state.startDelays or {}
+                    state.startDelays[slot]=max(state.startDelays[slot] or 0,request.delay)
+                end
+                return
+            end
+        end
     end
     local function velocity(x,z,limit)
         x,z=validNumber(x) or 0,validNumber(z) or 0
@@ -686,7 +844,7 @@ local function installHarvardCombatAssist(context)
     end
     -- This is called before the original face and target checks. It never sends a key.
     function context.harvardPrepareSkill(slot,now)
-        local allowed,why=confirmed(now,slot)
+        local allowed,why=confirmed(now,slot,true)
         if not allowed then
             state.blocked+=1;state.lastBlockedAt=now;state.lastBlockedSlot=slot
             rt.skillGate=why;return false,why
@@ -710,27 +868,42 @@ local function installHarvardCombatAssist(context)
         state.preparedAt=now;state.preparedSlot=slot;state.preparedAim=point
         return true,nil,point
     end
-    -- Recheck at key delivery as well, after all intermediate cast checks.
+    -- Store a short-lived input permit, tied to this character and this EIF cycle.
     function context.harvardCommitSkill(slot,now)
-        local allowed,why=confirmed(now,slot)
+        local allowed,why,sample=confirmed(now,slot,true)
         if not allowed then
             state.blocked+=1;state.lastBlockedAt=now;state.lastBlockedSlot=slot
             rt.skillGate=why;return false,why
         end
-        local slots=loadout()
-        if not buffSlot(slot,slots) then
+        state.permitSerial=(state.permitSerial or 0)+1
+        state.permits[slot]={id=state.permitSerial,character=sample.character,
+            cycle=sample.cycle,untilAt=now+0.15,required=sample.required,
+            name=sample.slots[slot],buff=buffSlot(slot,sample.slots)}
+        if buffSlot(slot,sample.slots) then
+            state.buffRequests[slot]={at=now,tool=sample.tools[slot]}
+        else
             local fresh=state.preparedSlot==slot and state.preparedAt and now-state.preparedAt<0.1
             local record={at=now,slot=slot,buff=state.eifValue,confirmed=state.eifActive,
                 required=state.eifRequired,hits=fresh and state.preparedAim and state.hits or nil,
-                skill=slots[slot],aim=fresh and state.preparedAim or nil}
+                skill=sample.slots[slot],aim=fresh and state.preparedAim or nil,
+                remaining=sample.remaining,needed=state.eifNeeded,cycle=sample.cycle,
+                expiresAt=sample.endsAt,timingSource=state.eifTimingSource}
             state.casts[#state.casts+1]=record
             while #state.casts>8 do table.remove(state.casts,1) end
         end
         return true
     end
-    function context.harvardAllowDeferredSkill(slot,now)
+    function context.harvardInputPermit(slot)
+        local permit=state.permits[slot]
+        return permit and permit.id
+    end
+    function context.harvardAllowDeferredSkill(slot,now,permitId)
         if rt.destroyed or not rt.farmEnabled then return false end
-        local allowed,why=confirmed(now,slot)
+        local permit=state.permits[slot]
+        if not permit or permit.id~=permitId or now>permit.untilAt
+            or permit.character~=context.LocalPlayer.Character then return false end
+        local allowed,why,sample=confirmed(now,slot,true)
+        if sample.slots[slot]~=permit.name or sample.cycle~=permit.cycle and not permit.buff then return false end
         if not allowed then
             state.blocked+=1;state.lastBlockedAt=now;state.lastBlockedSlot=slot
             rt.skillGate=why
@@ -1647,7 +1820,7 @@ end
 -- Bounded local replay of movement decisions. No network requests or movement.
 local function installDodgeReports(context)
     local cfg,rt=context.CFG,context.RT
-    local report={frames={},deaths={},life=0,status="V25: recording dodge decisions",lastSample=-math.huge,
+    local report={frames={},deaths={},life=0,status="V26: recording dodge decisions",lastSample=-math.huge,
         lastCaption=-math.huge,path="DQR_GildedV10/logs/dodge_last_death.json"}
     context.dodgeReports=report
     if cfg.harvardDodgeReports==nil then cfg.harvardDodgeReports=true end
@@ -1668,7 +1841,7 @@ local function installDodgeReports(context)
         local frames,deaths={},{}
         for i,frame in ipairs(report.frames) do frames[i]=frame end
         for i,death in ipairs(report.deaths) do deaths[i]=death end
-        return {version="V25",reason=reason,at=now,place_id=game.PlaceId,
+        return {version="V26",reason=reason,at=now,place_id=game.PlaceId,
             class=cfg.classProfile,npc_assist=cfg.harvardMobDodge~=false,
             speed21=cfg.harvardSpeed21~=false,pack_focus=cfg.harvardPackFocus~=false,
             strict_eif=cfg.harvardStrictEIF~=false,life=report.life,recent_deaths=deaths,frames=frames}
@@ -1696,7 +1869,7 @@ local function installDodgeReports(context)
     end
     function context.harvardSaveDodgeReport()
         local ok,result=persist(latest())
-        report.status=ok and "V25: dodge report saved" or "V25: report save failed"
+        report.status=ok and "V26: dodge report saved" or "V26: report save failed"
         message("Dodge report",ok and ("Saved "..report.path) or tostring(result))
         return ok,result
     end
@@ -1715,10 +1888,15 @@ local function installDodgeReports(context)
         if now-report.lastCaption<0.5 then return end
         report.lastCaption=now
         local mob=context.mobDodge
-        local text=cfg.harvardDodgeReports==false and "V25: dodge recording OFF" or report.status
+        local text=cfg.harvardDodgeReports==false and "V26: dodge recording OFF" or report.status
         if mob then
             text=text.." | NPC: "..tostring(mob.mode).." | read/used "
                 ..tostring(mob.sourceCount or 0).."/"..tostring(mob.acceptedCount or 0)
+        end
+        local combat=context.harvardCombat
+        if combat then
+            text=text.."\nEIF: "..tostring(combat.eifReason or "waiting")
+                ..(" | %.1fs left / %.1fs needed"):format(combat.eifRemaining or 0,combat.eifNeeded or 0)
         end
         if report.caption and report.caption.Parent then report.caption.Text=text end
     end
@@ -1784,6 +1962,9 @@ local function installDodgeReports(context)
             plan_age=mob and mob.planAt and finite(now-mob.planAt),
             eif_required=combat and combat.eifRequired,eif_active=combat and combat.eifActive,
             eif_value=combat and finite(combat.eifValue),eif_marker_present=combat and combat.markerPresent,
+            eif_marker_active=combat and combat.eifMarkerActive,eif_remaining=combat and finite(combat.eifRemaining),
+            eif_needed=combat and finite(combat.eifNeeded),eif_expires_at=combat and finite(combat.eifUntil),
+            eif_cycle=combat and combat.eifCycle,eif_timing_source=combat and combat.eifTimingSource,
             eif_reason=combat and combat.eifReason,eif_sample_at=combat and finite(combat.eifAt),
             loadout_q=combat and combat.slots and combat.slots.q,loadout_e=combat and combat.slots and combat.slots.e,
             eif_cooldown_phase=combat and combat.cooldownPhase,eif_cooldown_left=combat and finite(combat.cooldownLeft),
@@ -1795,7 +1976,10 @@ local function installDodgeReports(context)
         for _,request in ipairs(combat and combat.casts or {}) do
             frame.skill_requests[#frame.skill_requests+1]={at=finite(request.at),slot=request.slot,
                 skill=request.skill,buff=finite(request.buff),confirmed=request.confirmed,required=request.required,
-                hits=request.hits,aim=vector(request.aim)}
+                hits=request.hits,aim=vector(request.aim),remaining=finite(request.remaining),needed=finite(request.needed),
+                cycle=request.cycle,expires_at=finite(request.expiresAt),timing_source=request.timingSource,
+                started_at=finite(request.startedAt),buff_at_start=finite(request.buffAtStart),
+                active_at_start=request.activeAtStart,left_at_start=finite(request.leftAtStart),delay=finite(request.delay)}
         end
         for _,hit in ipairs(mob and mob.wallHits or {}) do
             if #frame.wall_hits>=8 then break end
@@ -1858,8 +2042,8 @@ local function installDodgeReports(context)
             if #report.deaths>3 then table.remove(report.deaths,1) end
             report.lastDeath=build("death",now)
             local ok,result=persist(report.lastDeath)
-            report.status=ok and "V25: last death saved; Copy dodge report"
-                or "V25: last death buffered; Copy dodge report"
+            report.status=ok and "V26: last death saved; Copy dodge report"
+                or "V26: last death buffered; Copy dodge report"
             report.saveError=not ok and tostring(result) or nil
         end
     end
@@ -1867,7 +2051,7 @@ local function installDodgeReports(context)
     context.sliderConnections=context.sliderConnections or {}
     context.sliderConnections[#context.sliderConnections+1]=runService.Heartbeat:Connect(function()
         local ok,err=pcall(context.dodgeReportTick,os.clock())
-        if not ok then report.status="V25: report error";report.error=tostring(err) end
+        if not ok then report.status="V26: report error";report.error=tostring(err) end
     end)
 end
 
@@ -1885,7 +2069,7 @@ local function installBossRecovery(context)
     local defaults = {}
     for _, key in ipairs(keys) do defaults[key] = {value=cfg[key]} end
     context.bossRecoveryDefaults = defaults
-    for _, key in ipairs({"harvardSpeed21","harvardMobDodge","harvardBossRecoveryV16","harvardDodgeReports","harvardMagePredict","harvardPackFocus","harvardStrictEIF"}) do
+    for _, key in ipairs({"harvardSpeed21","harvardMobDodge","harvardBossRecoveryV16","harvardDodgeReports","harvardMagePredict","harvardPackFocus","harvardStrictEIF","harvardEIFWindowV26"}) do
         local found = false
         for _, saved in ipairs(context.PERSIST) do if saved==key then found=true end end
         if not found then table.insert(context.PERSIST,key) end
@@ -70527,12 +70711,18 @@ components.movementCombat = function(context)
         value[2] = (capturedContext[2].vimRetries or 0) + 1
         value[1].vimRetries = value[2]
         local value2 = table.pack(...)
+        local retryPermit
+        if argument == virtualInputManager.SendKeyEvent and value2[1] == true
+            and (value2[2] == Enum.KeyCode.Q or value2[2] == Enum.KeyCode.E)
+            and context.harvardInputPermit then
+            retryPermit = context.harvardInputPermit(value2[2] == Enum.KeyCode.Q and "q" or "e")
+        end
         task.spawn(function()
             if argument == virtualInputManager.SendKeyEvent and value2[1] == true
                 and (value2[2] == Enum.KeyCode.Q or value2[2] == Enum.KeyCode.E)
                 and context.harvardAllowDeferredSkill then
                 local slot = value2[2] == Enum.KeyCode.Q and "q" or "e"
-                if not context.harvardAllowDeferredSkill(slot, os.clock()) then return end
+                if not context.harvardAllowDeferredSkill(slot, os.clock(), retryPermit) then return end
             end
             pcall(argument, virtualInputManager, table.unpack(value2, 1, value2.n))
         end)
@@ -71591,6 +71781,9 @@ components.movementCombat = function(context)
                 value4[4] = argument
                 value4[5] = argument2
                 value4[3][value4[4]] = value4[5]
+                if value7 and context.harvardObserveSkillStart then
+                    context.harvardObserveSkillStart(argument, argument2, os.clock())
+                end
                 if capturedContext[2].castOkAt then
                     if argument2 > capturedContext[2].castOkAt then
                         value4[6] = capturedContext[2]
@@ -148009,14 +148202,14 @@ components.interfaceMainLoop = function(context)
         end,function(enabled)
             config.harvardStrictEIF=enabled
             saveConfig()
-        end,13,"When Inner Focus or Inner Rage is equipped, confirm spellBuff before damage skills. Buff keys remain available while waiting."))
+        end,13,"Wait for the next EIF when too little buff time remains to finish a damage skill. Buff keys remain available while waiting."))
         local dodgeReportRow=uiLibrary.buttonRow(runsThisAccount, 9)
         dodgeReportRow.add("Copy dodge report", "secondary", function() context.harvardCopyDodgeReport() end,
             "Copy the last death's movement report, or the current report if there has been no death.")
         dodgeReportRow.add("Save dodge report", "secondary", function() context.harvardSaveDodgeReport() end,
             "Save the report as DQR_GildedV10/logs/dodge_last_death.json in the executor workspace.")
-        context.dodgeReports.caption=uiLibrary.label(runsThisAccount,"V25: recording dodge decisions","captionSub",10)
-        context.dodgeReports.caption.Size=UDim2.new(1,0,0,38)
+        context.dodgeReports.caption=uiLibrary.label(runsThisAccount,"V26: recording dodge decisions","captionSub",10)
+        context.dodgeReports.caption.Size=UDim2.new(1,0,0,68)
         context.dodgeReports.caption.TextWrapped=true
         local persistenceRow = uiLibrary.buttonRow(runsThisAccount, 3)
         persistenceRow.add("Save config now", "accent", function() context.harvardSaveNow() end,
@@ -166704,7 +166897,7 @@ local ok, reason = xpcall(function()
     for index, name in ipairs(order) do
         if stopped then return end
         currentStage = name
-        print(("[DQR Harvard V25] Loading %d/18: %s"):format(index, name))
+        print(("[DQR Harvard V26] Loading %d/18: %s"):format(index, name))
         components[name](context)
         if name == "movementCombat" then
             installBossRecoveryMovement(context)
@@ -166722,7 +166915,7 @@ local ok, reason = xpcall(function()
         task.wait()
     end
     if stopped then return end
-    context.INTEGRATION_VERSION = "V25 Harvard pack targeting and confirmed EIF casts"
+    context.INTEGRATION_VERSION = "V26 Harvard EIF windup window and expiring input permits"
     context.harvardPersistence.refresh()
     pcall(context.saveConfig)
     local dungeon = context.Workspace:FindFirstChild("dungeonName")
@@ -166737,10 +166930,10 @@ local ok, reason = xpcall(function()
     if context.notify then
         context.notify("run", "Harvard ready", "Auto-start dungeon: " .. (context.CFG.autoStartDungeon ~= false and "ON" or "OFF") .. ". All controls are in this menu.")
     end
-    print("[DQR Harvard V25] Ready: Harvard menu only; auto-start " .. tostring(context.CFG.autoStartDungeon ~= false))
+    print("[DQR Harvard V26] Ready: Harvard menu only; auto-start " .. tostring(context.CFG.autoStartDungeon ~= false))
 end, function(err) return debug.traceback(tostring(err), 2) end)
 if not ok then
-    warn("[DQR Harvard V25] " .. currentStage .. ": " .. tostring(reason))
+    warn("[DQR Harvard V26] " .. currentStage .. ": " .. tostring(reason))
     stopHarvardEngine()
     pcall(function()
         getService("StarterGui"):SetCore("SendNotification", {
@@ -166763,8 +166956,8 @@ local cached, cacheError = pcall(function()
     assert(readfile(cachePath)==payload, "saved engine verification failed")
 end)
 env.DQRHarvardCacheReady = cached
-if not cached then warn("[DQR Harvard V25] Auto-execute cache unavailable: "..tostring(cacheError)) end
+if not cached then warn("[DQR Harvard V26] Auto-execute cache unavailable: "..tostring(cacheError)) end
 assert(type(loadstring)=="function", "Executor loadstring is required to run the bundled engine")
-local run, compileError = loadstring(payload,"@DQR_Harvard_V25")
+local run, compileError = loadstring(payload,"@DQR_Harvard_V26")
 assert(run,tostring(compileError))
 return run()
