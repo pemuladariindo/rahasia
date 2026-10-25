@@ -1,13 +1,14 @@
 --[[
-DQR GILDED V24 - HARVARD / KNIGHT APPROACH WARNINGS
+DQR GILDED V25 - HARVARD / PACK FOCUS + CONFIRMED EIF
 Run this complete file once. It saves its bundled engine in the executor's local
 workspace and runs it. No HTTP downloads or external code are used.
 
-Closing Knights can trigger advisory steering before a ground marker appears.
-Advisory spacing never forbids crossing a real beam's shortest escape route.
-Knight circle markers carry an earlier planning deadline; the original reader is unchanged.
-Original boss/combat components and the saved movement-speed choice are retained.
+Known area skills prefer reachable packs; single remaining enemies keep the original targeting.
+Damage skills require an active spellBuff when EIF/Inner Rage is equipped.
+Buff confirmation is repeated immediately before key delivery, including boss casts.
+V24 dodge movement and the saved movement-speed choice are retained.
 Harvard > Autofarm:
+- Focus enemy packs / Require active EIF for damage (ON by default, saved per account)
 - Mob dodge assist / Predict mage windups (ON by default)
 - Record dodge reports / Copy dodge report / Save dodge report
 - Save config now / Load saved config
@@ -29,7 +30,7 @@ local env = type(getgenv) == "function" and getgenv() or _G
 local payload = [=====[
 -- DQR_HARVARD_RUNTIME_V12
 --[[
-DQR HARVARD V24 RUNTIME
+DQR HARVARD V25 RUNTIME
 All 18 user-supplied reference components; Harvard menu only.
 Per-account save/load, autosave and teleport auto-execute are available in Autofarm.
 This local cached engine is installed by DQR_Gilded_V12_AutoExec.lua.
@@ -352,6 +353,390 @@ local function installHarvardPersistence(context)
         if now - lastStatus >= 2 then lastStatus = now; state.refresh() end
     end)
     table.insert(context.sliderConnections, state.statusConnection)
+end
+
+-- Pack aiming changes facing/target choice only. Escape movement remains owned by the dodge controller.
+local function installHarvardCombatAssist(context)
+    local cfg,rt,rd=context.CFG,context.RT,context.RD
+    local state={status="waiting",casts={},blocked=0,lastScan=-math.huge}
+    context.harvardCombat=state
+    for _,key in ipairs({"harvardPackFocus","harvardStrictEIF"}) do
+        if cfg[key]==nil then cfg[key]=true end
+        local found=false
+        for _,saved in ipairs(context.PERSIST or {}) do if saved==key then found=true;break end end
+        if not found then table.insert(context.PERSIST,key) end
+    end
+    local abs,min,max,sqrt=math.abs,math.min,math.max,math.sqrt
+    local innerNames={ ["inner focus"]=true,["enhanced inner focus"]=true,
+        ["inner rage"]=true,["enhanced inner rage"]=true }
+    local function nameOf(value)
+        return string.lower(tostring(value or "")):match("^%s*(.-)%s*$")
+    end
+    local function validNumber(value)
+        local n=tonumber(value)
+        return n and n==n and abs(n)<1e9 and n or nil
+    end
+    local function scope(now)
+        if context.harvardInGilded then return context.harvardInGilded(now) end
+        return game.PlaceId==101088859550383 or game.PlaceId==85776757589518 or game.PlaceId==115445507767090
+    end
+    local function live(e)
+        return e and e.root and e.root.Parent and e.humanoid and e.humanoid.Health>0
+    end
+    local function room(e)
+        local parent=e and e.model and e.model.Parent
+        for _=1,10 do
+            if not parent or parent==context.Workspace then return nil end
+            if nameOf(parent.Name):match("^room%d+$") or nameOf(parent.Name):match("^g%d+$") then return parent end
+            parent=parent.Parent
+        end
+    end
+    local function loadout()
+        local slots,tools={},{}
+        local player=context.LocalPlayer
+        local character=player and player.Character
+        if state.character~=character then
+            state.character=character;state.casts={};state.targetCache=nil
+            state.preparedAt=nil;state.preparedAim=nil;state.planAt=nil;state.aim=nil
+            state.hits=nil;state.total=nil;state.previousHits=nil
+        end
+        for _,container in pairs({player and player.Backpack,character}) do
+            if container then
+                for _,tool in ipairs(container:GetChildren()) do
+                    if tool:IsA("Tool") then
+                        local marker=tool:FindFirstChild("abilitySlot")
+                        local slot=marker and nameOf(marker.Value)
+                        if slot=="q" or slot=="e" then slots[slot]=nameOf(tool.Name);tools[slot]=tool end
+                    end
+                end
+            end
+        end
+        local gui=player and player:FindFirstChild("PlayerGui")
+        local main=gui and gui:FindFirstChild("MainUI")
+        for _,slot in ipairs({"q","e"}) do
+            if not slots[slot] then
+                local button=main and main:FindFirstChild(slot=="q" and "spell1" or "spell2")
+                local label=button and button:FindFirstChild("name")
+                if label and nameOf(label.Value)~="" then slots[slot]=nameOf(label.Value) end
+            end
+            if not slots[slot] then
+                local known=rd.abilitySlots and rd.abilitySlots[slot]
+                if known and nameOf(known.name)~="" then slots[slot]=nameOf(known.name) end
+            end
+        end
+        local required,buffSlot=false,nil
+        for _,slot in ipairs({"q","e"}) do
+            if innerNames[slots[slot]] then required=true;buffSlot=slot end
+        end
+        -- During a loadout transition, an explicitly saved EIF slot is still expected.
+        -- A live replacement in that slot takes precedence over the saved choice.
+        if type(cfg.gsLoadout)=="table" then
+            for _,slot in ipairs({"q","e"}) do
+                if not slots[slot] and innerNames[nameOf(cfg.gsLoadout[slot])] then required=true;buffSlot=slot end
+            end
+        end
+        return slots,tools,required,buffSlot,character
+    end
+    local function effect()
+        local character=context.LocalPlayer and context.LocalPlayer.Character
+        local marker=character and character:FindFirstChild("spellBuff")
+        local amount=marker and validNumber(marker.Value)
+        return amount~=nil and amount>0,amount,marker~=nil
+    end
+    local function buffSlot(slot,slots)
+        local name=slots[slot]
+        if innerNames[name] then return true end
+        for _,other in ipairs(cfg.buffSpells or {}) do if name==nameOf(other) then return true end end
+        return false
+    end
+    local oldIsBuff=context.isBuffSlot
+    context.isBuffSlot=function(slot)
+        local slots=loadout()
+        if buffSlot(slot,slots) then return true end
+        -- A live damage tool overrides the reader's possibly stale buff-slot cache.
+        if slots[slot] then return false end
+        return oldIsBuff and oldIsBuff(slot) or false
+    end
+    local oldGsBuff=context.gsIsBuffKey
+    context.gsIsBuffKey=function(key)
+        local oldFlag,oldButton
+        if oldGsBuff then oldFlag,oldButton=oldGsBuff(key) end
+        local slot=key==Enum.KeyCode.Q and "q" or key==Enum.KeyCode.E and "e" or nil
+        if slot then
+            local slots=loadout()
+            if buffSlot(slot,slots) then
+                local player=context.LocalPlayer
+                local gui=player and player:FindFirstChild("PlayerGui")
+                local main=gui and gui:FindFirstChild("MainUI")
+                local button=main and main:FindFirstChild(slot=="q" and "spell1" or "spell2")
+                return true,button or oldButton
+            end
+            if slots[slot] then return false end
+        end
+        return oldFlag or false,oldButton
+    end
+    local oldState,oldUp,oldGsUp=context.buffState,context.buffUp,context.gsSpeedUp
+    context.buffState=function(now)
+        now=now or os.clock()
+        local phase,slot,left=oldState(now)
+        state.cooldownPhase=phase;state.cooldownLeft=left
+        local _,tools,required,innerSlot=loadout()
+        if cfg.harvardStrictEIF==false or not scope(now) or not required then return phase,slot,left end
+        local active=effect()
+        if active then return "up",innerSlot,phase=="up" and left or 0 end
+        local tool=tools[innerSlot]
+        local cd=tool and tool:FindFirstChild("cooldown")
+        local remaining=cd and validNumber(cd.Value)
+        if remaining~=nil then
+            return remaining>0 and "gap" or "ready",innerSlot,max(remaining,0)
+        end
+        -- Cooldown-inferred "up" is not confirmation that EIF is currently active.
+        if phase=="up" or phase=="gap" then return "gap",innerSlot,left or 0 end
+        return "ready",innerSlot,0
+    end
+    context.buffUp=function(now)
+        now=now or os.clock()
+        local _,_,required=loadout()
+        if cfg.harvardStrictEIF~=false and scope(now or os.clock()) and required then
+            local active=effect()
+            rt.buffUpUntil=active and (now or os.clock())+0.1 or 0
+            return active
+        end
+        return oldUp and oldUp(now) or false
+    end
+    context.gsSpeedUp=function()
+        local _,_,required=loadout()
+        if cfg.harvardStrictEIF~=false and scope(os.clock()) and required then return effect() end
+        if oldGsUp then return oldGsUp() end
+        return true
+    end
+    local function confirmed(now,slot)
+        local slots,_,required,_,character=loadout()
+        local active,amount,present=effect()
+        state.eifRequired=required;state.eifActive=active;state.eifValue=amount;state.markerPresent=present
+        state.eifAt=now;state.slots=slots
+        if cfg.harvardStrictEIF==false or not scope(now) or slot and buffSlot(slot,slots) then return true end
+        if not required then
+            if not next(slots) then state.eifReason="loadout pending";return false,"loadout pending" end
+            state.eifReason="no EIF equipped";return true
+        end
+        local hum=character and character:FindFirstChildOfClass("Humanoid")
+        if not hum or hum.Health<=0 then state.eifReason="no character";return false,"no character" end
+        if active then state.eifReason="confirmed spellBuff";return true end
+        local phase=context.buffState(now)
+        state.eifReason=present and "EIF inactive" or "EIF marker pending"
+        return false,phase=="ready" and "ready" or state.eifReason
+    end
+    local oldAllowed=context.attackAllowedBySkill
+    context.attackAllowedBySkill=function(now)
+        now=now or os.clock()
+        local allowed,why=confirmed(now)
+        if not allowed then rt.skillGate=why;return false,why end
+        if oldAllowed then return oldAllowed(now) end
+        return true,"confirmed"
+    end
+    function context.harvardCombatSample(now)
+        confirmed(now)
+    end
+    local function velocity(x,z,limit)
+        x,z=validNumber(x) or 0,validNumber(z) or 0
+        local length=sqrt(x*x+z*z)
+        if length>limit then x,z=x/length*limit,z/length*limit end
+        return x,z
+    end
+    local function shape(slot,slots)
+        local key=slot
+        if not key then
+            for _,s in ipairs({"e","q"}) do if slots[s] and not buffSlot(s,slots) then key=s;break end end
+        end
+        if not key or buffSlot(key,slots) then return nil end
+        local name=slots[key]
+        local known=context.gsAoe and context.gsAoe(name) or cfg.aoeKnown and cfg.aoeKnown[name]
+        local measured=rd.abilitySlots and rd.abilitySlots[key]
+        -- Do not apply a measurement that still belongs to a previous loadout.
+        if measured and nameOf(measured.name)~=name then measured=nil end
+        if measured and measured.measured and measured.aoeX and measured.aoeZ then
+            local place=measured.placeMed or measured.lastPlaceD or known and known.place
+            if place then return {d=place,x=measured.aoeX,z=measured.aoeZ,round=measured.aoeRound~=false,key=key} end
+        end
+        if known and known.place and known.x then
+            return {d=known.place,x=known.x,z=known.z or known.x,round=known.round==true,key=key}
+        end
+        -- A slot without a known or measured footprint keeps the original aim.
+    end
+    local function encounter(origin,original,now)
+        if cfg.harvardPackFocus==false or not scope(now) or not rt.farmEnabled or rt.destroyed then return nil end
+        if not live(original) or original.isBoss or rt.gsLookOn or rd.safeField and (rd.safeField.untilAt or 0)>now then return nil end
+        if rt.pull and (rt.pull.phase=="lead" or rt.pull.phase=="wait") then return nil end
+        local currentRoom=room(original)
+        for _,e in ipairs(rd.enemies or {}) do
+            if e.isBoss and live(e) then
+                local p=e.root.Position
+                if (p.X-origin.X)^2+(p.Z-origin.Z)^2<180^2 then
+                    local bossRoom=room(e)
+                    if not (currentRoom and bossRoom and currentRoom~=bossRoom) then return nil end
+                end
+            end
+        end
+        return currentRoom or false
+    end
+    local function visible(origin,e)
+        if not context.Workspace.Raycast or not context.raycastParams then return true end
+        local start=origin+Vector3.new(0,1,0)
+        local goal=e.root.Position+Vector3.new(0,1,0)
+        local hit=context.Workspace:Raycast(start,goal-start,context.raycastParams())
+        if not hit then return true end
+        return hit.Instance and e.model and hit.Instance.IsDescendantOf and hit.Instance:IsDescendantOf(e.model) or false
+    end
+    local function plan(origin,fallback,slot,now,original)
+        original=original or context.BR.target
+        local currentRoom=encounter(origin,original,now)
+        if currentRoom==nil then state.status="original controller";return nil end
+        local slots=loadout()
+        local footprint=shape(slot,slots)
+        if not footprint then state.status="unknown skill footprint";return nil end
+        for _,n in ipairs({footprint.d,footprint.x,footprint.z}) do
+            if not validNumber(n) or n<0 or n>300 then return nil end
+        end
+        local reach=context.fireReach and context.fireReach() or 60
+        local radius=min(120,max(reach,footprint.d+footprint.z*0.5))
+        local lead=min(0.4,max(0,context.gsAimLeadT and context.gsAimLeadT() or 0.25))
+        local entries={}
+        for _,e in ipairs(rd.enemies or {}) do
+            if not e.isBoss and live(e) and (not currentRoom or room(e)==currentRoom) then
+                local p=e.root.Position
+                local distance=(p.X-origin.X)^2+(p.Z-origin.Z)^2
+                if abs(p.Y-origin.Y)<=16 and distance<=radius^2 and visible(origin,e) then
+                    local vx,vz=velocity(e.vx,e.vz,34)
+                    entries[#entries+1]={e=e,x=p.X,z=p.Z,px=p.X+vx*lead,pz=p.Z+vz*lead,distance=distance}
+                end
+            end
+        end
+        table.sort(entries,function(a,b) return a.distance<b.distance end)
+        while #entries>32 do table.remove(entries) end
+        if #entries<2 then state.status="single target";return nil end
+        local px,pz=origin.X,origin.Z
+        local _,_,root=context.character()
+        if root and root.AssemblyLinearVelocity then
+            local vx,vz=velocity(root.AssemblyLinearVelocity.X,root.AssemblyLinearVelocity.Z,24)
+            px+=vx*min(lead,0.2);pz+=vz*min(lead,0.2)
+        end
+        local function penetration(x,z,ox,oz,dx,dz)
+            local a,b=x-(ox+dx*footprint.d),z-(oz+dz*footprint.d)
+            if footprint.round then return footprint.x*0.5-1.5-sqrt(a*a+b*b) end
+            return min(footprint.z*0.5-1.5-abs(a*dx+b*dz),footprint.x*0.5-1.5-abs(-a*dz+b*dx))
+        end
+        local function score(dx,dz)
+            local count,stable,depth=0,0,0
+            for _,v in ipairs(entries) do
+                local inside=penetration(v.px,v.pz,px,pz,dx,dz)
+                if inside>=0 then
+                    count+=1;depth+=min(inside,12)
+                    if penetration(v.x,v.z,origin.X,origin.Z,dx,dz)>=0 then stable+=1 end
+                end
+            end
+            return count,stable,depth
+        end
+        local fx,fz=0,1
+        if fallback then fx,fz=fallback.X-origin.X,fallback.Z-origin.Z end
+        local length=sqrt(fx*fx+fz*fz)
+        if length>0.01 then fx,fz=fx/length,fz/length else fx,fz=0,1 end
+        local bestN,bestStable,bestDepth=score(fx,fz)
+        local originalN=bestN
+        local dx,dz=fx,fz
+        local function candidate(x,z)
+            local n,stable,depth=score(x,z)
+            if n>bestN or n==bestN and (stable>bestStable or stable==bestStable and depth>bestDepth+1) then
+                bestN,bestStable,bestDepth,dx,dz=n,stable,depth,x,z
+            end
+        end
+        for angle=0,355,5 do local rad=math.rad(angle);candidate(math.cos(rad),math.sin(rad)) end
+        for _,v in ipairs(entries) do
+            local x,z=v.px-px,v.pz-pz
+            local d=sqrt(x*x+z*z)
+            if d>0.01 then candidate(x/d,z/d) end
+        end
+        if bestN<2 then state.status="no reachable pack";return nil end
+        local centerX,centerZ=px+dx*footprint.d,pz+dz*footprint.d
+        local anchor,closest=nil,math.huge
+        for _,v in ipairs(entries) do
+            if v.distance<=reach^2 and penetration(v.px,v.pz,px,pz,dx,dz)>=0 then
+                local d=(v.px-centerX)^2+(v.pz-centerZ)^2
+                if d<closest then closest=d;anchor=v.e end
+            end
+        end
+        if not anchor then state.status="pack outside cast reach";return nil end
+        local point=Vector3.new(origin.X+dx*max(footprint.d,20),origin.Y,origin.Z+dz*max(footprint.d,20))
+        state.status="pack focus";state.hits=bestN;state.total=#entries;state.previousHits=originalN
+        state.aim=point;state.anchor=anchor;state.planAt=now;state.skill=slots[footprint.key]
+        return point,bestN,#entries,anchor
+    end
+    function context.harvardPackAim(origin,fallback,slot,now)
+        return plan(origin,fallback,slot,now or os.clock())
+    end
+    function context.harvardSelectPackTarget(origin,original,now)
+        local cache=state.targetCache
+        if cache and cache.original==original and now-cache.at<0.15 and live(cache.target)
+            and (origin-cache.origin).Magnitude<3 and encounter(origin,original,now)~=nil then return cache.target end
+        local fallback=live(original) and original.root.Position
+        local _,hits,_,anchor=plan(origin,fallback,nil,now,original)
+        local chosen=anchor and hits>=2 and anchor or original
+        state.targetCache={original=original,target=chosen,origin=origin,at=now}
+        return chosen
+    end
+    -- This is called before the original face and target checks. It never sends a key.
+    function context.harvardPrepareSkill(slot,now)
+        local allowed,why=confirmed(now,slot)
+        if not allowed then
+            state.blocked+=1;state.lastBlockedAt=now;state.lastBlockedSlot=slot
+            rt.skillGate=why;return false,why
+        end
+        local slots=loadout()
+        if buffSlot(slot,slots) then return true end
+        local _,hum,root=context.character()
+        if not root or not hum or hum.Health<=0 then return false,"no character" end
+        local face=rt.castFace
+        local fallback=face and face.dx and Vector3.new(root.Position.X+face.dx*40,root.Position.Y,root.Position.Z+face.dz*40)
+            or context.BR.aim or context.BR.target and context.BR.target.root and context.BR.target.root.Position
+        local point=plan(root.Position,fallback,slot,now)
+        if point then
+            local delta=point-root.Position
+            local d=sqrt(delta.X^2+delta.Z^2)
+            if d>0.01 then
+                rt.castFace={dx=delta.X/d,dz=delta.Z/d,x=point.X,z=point.Z,at=now,pressedAt=now}
+                context.BR.aim=point
+            end
+        end
+        state.preparedAt=now;state.preparedSlot=slot;state.preparedAim=point
+        return true,nil,point
+    end
+    -- Recheck at key delivery as well, after all intermediate cast checks.
+    function context.harvardCommitSkill(slot,now)
+        local allowed,why=confirmed(now,slot)
+        if not allowed then
+            state.blocked+=1;state.lastBlockedAt=now;state.lastBlockedSlot=slot
+            rt.skillGate=why;return false,why
+        end
+        local slots=loadout()
+        if not buffSlot(slot,slots) then
+            local fresh=state.preparedSlot==slot and state.preparedAt and now-state.preparedAt<0.1
+            local record={at=now,slot=slot,buff=state.eifValue,confirmed=state.eifActive,
+                required=state.eifRequired,hits=fresh and state.preparedAim and state.hits or nil,
+                skill=slots[slot],aim=fresh and state.preparedAim or nil}
+            state.casts[#state.casts+1]=record
+            while #state.casts>8 do table.remove(state.casts,1) end
+        end
+        return true
+    end
+    function context.harvardAllowDeferredSkill(slot,now)
+        if rt.destroyed or not rt.farmEnabled then return false end
+        local allowed,why=confirmed(now,slot)
+        if not allowed then
+            state.blocked+=1;state.lastBlockedAt=now;state.lastBlockedSlot=slot
+            rt.skillGate=why
+        end
+        return allowed
+    end
 end
 
 -- NPC-only escape patterns. Boss frames always return to the original brain.
@@ -1262,7 +1647,7 @@ end
 -- Bounded local replay of movement decisions. No network requests or movement.
 local function installDodgeReports(context)
     local cfg,rt=context.CFG,context.RT
-    local report={frames={},deaths={},life=0,status="V24: recording dodge decisions",lastSample=-math.huge,
+    local report={frames={},deaths={},life=0,status="V25: recording dodge decisions",lastSample=-math.huge,
         lastCaption=-math.huge,path="DQR_GildedV10/logs/dodge_last_death.json"}
     context.dodgeReports=report
     if cfg.harvardDodgeReports==nil then cfg.harvardDodgeReports=true end
@@ -1283,9 +1668,10 @@ local function installDodgeReports(context)
         local frames,deaths={},{}
         for i,frame in ipairs(report.frames) do frames[i]=frame end
         for i,death in ipairs(report.deaths) do deaths[i]=death end
-        return {version="V24",reason=reason,at=now,place_id=game.PlaceId,
+        return {version="V25",reason=reason,at=now,place_id=game.PlaceId,
             class=cfg.classProfile,npc_assist=cfg.harvardMobDodge~=false,
-            speed21=cfg.harvardSpeed21~=false,life=report.life,recent_deaths=deaths,frames=frames}
+            speed21=cfg.harvardSpeed21~=false,pack_focus=cfg.harvardPackFocus~=false,
+            strict_eif=cfg.harvardStrictEIF~=false,life=report.life,recent_deaths=deaths,frames=frames}
     end
     local function encode(data)
         local service=context.HttpService or game:GetService("HttpService")
@@ -1310,7 +1696,7 @@ local function installDodgeReports(context)
     end
     function context.harvardSaveDodgeReport()
         local ok,result=persist(latest())
-        report.status=ok and "V24: dodge report saved" or "V24: report save failed"
+        report.status=ok and "V25: dodge report saved" or "V25: report save failed"
         message("Dodge report",ok and ("Saved "..report.path) or tostring(result))
         return ok,result
     end
@@ -1329,7 +1715,7 @@ local function installDodgeReports(context)
         if now-report.lastCaption<0.5 then return end
         report.lastCaption=now
         local mob=context.mobDodge
-        local text=cfg.harvardDodgeReports==false and "V24: dodge recording OFF" or report.status
+        local text=cfg.harvardDodgeReports==false and "V25: dodge recording OFF" or report.status
         if mob then
             text=text.." | NPC: "..tostring(mob.mode).." | read/used "
                 ..tostring(mob.sourceCount or 0).."/"..tostring(mob.acceptedCount or 0)
@@ -1360,6 +1746,8 @@ local function installDodgeReports(context)
         report.lastSample=now
         local mob=context.mobDodge
         local rd=context.RD or {}
+        if context.harvardCombatSample then pcall(context.harvardCombatSample,now) end
+        local combat=context.harvardCombat
         local target=context.BR and context.BR.target
         local humState
         if hum.GetState then pcall(function() humState=tostring(hum:GetState()) end) end
@@ -1394,7 +1782,21 @@ local function installDodgeReports(context)
             exposure_actual=mob and finite(mob.attackExposure),
             knight_alerts=mob and mob.knightAlerts,
             plan_age=mob and mob.planAt and finite(now-mob.planAt),
-            zones={},predictions={},keepouts={},warning_deadlines={},wall_hits={},enemies={}}
+            eif_required=combat and combat.eifRequired,eif_active=combat and combat.eifActive,
+            eif_value=combat and finite(combat.eifValue),eif_marker_present=combat and combat.markerPresent,
+            eif_reason=combat and combat.eifReason,eif_sample_at=combat and finite(combat.eifAt),
+            loadout_q=combat and combat.slots and combat.slots.q,loadout_e=combat and combat.slots and combat.slots.e,
+            eif_cooldown_phase=combat and combat.cooldownPhase,eif_cooldown_left=combat and finite(combat.cooldownLeft),
+            skill_blocks=combat and combat.blocked,pack_status=combat and combat.status,
+            pack_hits=combat and combat.hits,pack_total=combat and combat.total,
+            pack_previous_hits=combat and combat.previousHits,pack_aim=combat and vector(combat.aim),
+            pack_plan_at=combat and finite(combat.planAt),pack_skill=combat and combat.skill,
+            zones={},predictions={},keepouts={},warning_deadlines={},wall_hits={},enemies={},skill_requests={}} 
+        for _,request in ipairs(combat and combat.casts or {}) do
+            frame.skill_requests[#frame.skill_requests+1]={at=finite(request.at),slot=request.slot,
+                skill=request.skill,buff=finite(request.buff),confirmed=request.confirmed,required=request.required,
+                hits=request.hits,aim=vector(request.aim)}
+        end
         for _,hit in ipairs(mob and mob.wallHits or {}) do
             if #frame.wall_hits>=8 then break end
             frame.wall_hits[#frame.wall_hits+1]={x=finite(hit.x),z=finite(hit.z),
@@ -1456,8 +1858,8 @@ local function installDodgeReports(context)
             if #report.deaths>3 then table.remove(report.deaths,1) end
             report.lastDeath=build("death",now)
             local ok,result=persist(report.lastDeath)
-            report.status=ok and "V24: last death saved; Copy dodge report"
-                or "V24: last death buffered; Copy dodge report"
+            report.status=ok and "V25: last death saved; Copy dodge report"
+                or "V25: last death buffered; Copy dodge report"
             report.saveError=not ok and tostring(result) or nil
         end
     end
@@ -1465,7 +1867,7 @@ local function installDodgeReports(context)
     context.sliderConnections=context.sliderConnections or {}
     context.sliderConnections[#context.sliderConnections+1]=runService.Heartbeat:Connect(function()
         local ok,err=pcall(context.dodgeReportTick,os.clock())
-        if not ok then report.status="V24: report error";report.error=tostring(err) end
+        if not ok then report.status="V25: report error";report.error=tostring(err) end
     end)
 end
 
@@ -1483,7 +1885,7 @@ local function installBossRecovery(context)
     local defaults = {}
     for _, key in ipairs(keys) do defaults[key] = {value=cfg[key]} end
     context.bossRecoveryDefaults = defaults
-    for _, key in ipairs({"harvardSpeed21","harvardMobDodge","harvardBossRecoveryV16","harvardDodgeReports","harvardMagePredict"}) do
+    for _, key in ipairs({"harvardSpeed21","harvardMobDodge","harvardBossRecoveryV16","harvardDodgeReports","harvardMagePredict","harvardPackFocus","harvardStrictEIF"}) do
         local found = false
         for _, saved in ipairs(context.PERSIST) do if saved==key then found=true end end
         if not found then table.insert(context.PERSIST,key) end
@@ -70126,6 +70528,12 @@ components.movementCombat = function(context)
         value[1].vimRetries = value[2]
         local value2 = table.pack(...)
         task.spawn(function()
+            if argument == virtualInputManager.SendKeyEvent and value2[1] == true
+                and (value2[2] == Enum.KeyCode.Q or value2[2] == Enum.KeyCode.E)
+                and context.harvardAllowDeferredSkill then
+                local slot = value2[2] == Enum.KeyCode.Q and "q" or "e"
+                if not context.harvardAllowDeferredSkill(slot, os.clock()) then return end
+            end
             pcall(argument, virtualInputManager, table.unpack(value2, 1, value2.n))
         end)
     end
@@ -70347,6 +70755,19 @@ components.movementCombat = function(context)
     end
     local function helper42(argument)
         local value = {}
+        if (argument == Enum.KeyCode.Q or argument == Enum.KeyCode.E) and context.harvardPrepareSkill then
+            local slot = argument == Enum.KeyCode.Q and "q" or "e"
+            local allowed, why, aim = context.harvardPrepareSkill(slot, os.clock())
+            if not allowed then
+                if context.castWatch then context.castWatch(slot, os.clock(), true) end
+                capturedContext[2].skillGate = why
+                return false
+            end
+            if aim then
+                local _, hum, root = context.character()
+                if root and hum then helper14(root, hum, aim) end
+            end
+        end
         if capturedContext[2].bugKey then
             local protectedCall, bugKey, value2 =
                 pcall,
@@ -70493,6 +70914,15 @@ components.movementCombat = function(context)
                 value[3] = capturedContext[2]
                 value[4] = (os.clock())
                 value[3].healPaceAt = value[4]
+            end
+        end
+        if (argument == Enum.KeyCode.Q or argument == Enum.KeyCode.E) and context.harvardCommitSkill then
+            local slot = argument == Enum.KeyCode.Q and "q" or "e"
+            local allowed, why = context.harvardCommitSkill(slot, os.clock())
+            if not allowed then
+                if context.castWatch then context.castWatch(slot, os.clock(), true) end
+                capturedContext[2].skillGate = why
+                return false
             end
         end
         helper41(virtualInputManager.SendKeyEvent, true, argument, false, game)
@@ -95898,6 +96328,9 @@ components.movementCombat = function(context)
             end
         end
         local target = helper24(posSeen)
+        if context.harvardSelectPackTarget then
+            target = context.harvardSelectPackTarget(posSeen, target, argument)
+        end
         combatBrain.target = target
         combatBrain.aim = nil
         if context.PB then
@@ -147565,12 +147998,24 @@ components.interfaceMainLoop = function(context)
             config.harvardMagePredict=enabled
             saveConfig()
         end,11,"Anticipate the full mage cross from its visible first arm or a recognized cast animation. Unknown animations are only recorded."))
+        helper(uiLibrary.toggle(runsThisAccount,"Focus enemy packs",function()
+            return config.harvardPackFocus~=false
+        end,function(enabled)
+            config.harvardPackFocus=enabled
+            saveConfig()
+        end,12,"Aim known area skills at the most reachable regular enemies from the current position. Dodge and boss control retain priority."))
+        helper(uiLibrary.toggle(runsThisAccount,"Require active EIF for damage",function()
+            return config.harvardStrictEIF~=false
+        end,function(enabled)
+            config.harvardStrictEIF=enabled
+            saveConfig()
+        end,13,"When Inner Focus or Inner Rage is equipped, confirm spellBuff before damage skills. Buff keys remain available while waiting."))
         local dodgeReportRow=uiLibrary.buttonRow(runsThisAccount, 9)
         dodgeReportRow.add("Copy dodge report", "secondary", function() context.harvardCopyDodgeReport() end,
             "Copy the last death's movement report, or the current report if there has been no death.")
         dodgeReportRow.add("Save dodge report", "secondary", function() context.harvardSaveDodgeReport() end,
             "Save the report as DQR_GildedV10/logs/dodge_last_death.json in the executor workspace.")
-        context.dodgeReports.caption=uiLibrary.label(runsThisAccount,"V24: recording dodge decisions","captionSub",10)
+        context.dodgeReports.caption=uiLibrary.label(runsThisAccount,"V25: recording dodge decisions","captionSub",10)
         context.dodgeReports.caption.Size=UDim2.new(1,0,0,38)
         context.dodgeReports.caption.TextWrapped=true
         local persistenceRow = uiLibrary.buttonRow(runsThisAccount, 3)
@@ -166259,10 +166704,11 @@ local ok, reason = xpcall(function()
     for index, name in ipairs(order) do
         if stopped then return end
         currentStage = name
-        print(("[DQR Harvard V24] Loading %d/18: %s"):format(index, name))
+        print(("[DQR Harvard V25] Loading %d/18: %s"):format(index, name))
         components[name](context)
         if name == "movementCombat" then
             installBossRecoveryMovement(context)
+            installHarvardCombatAssist(context)
             installMobReflex(context)
             installDodgeReports(context)
         end
@@ -166276,7 +166722,7 @@ local ok, reason = xpcall(function()
         task.wait()
     end
     if stopped then return end
-    context.INTEGRATION_VERSION = "V24 Harvard Knight approach and circle deadlines"
+    context.INTEGRATION_VERSION = "V25 Harvard pack targeting and confirmed EIF casts"
     context.harvardPersistence.refresh()
     pcall(context.saveConfig)
     local dungeon = context.Workspace:FindFirstChild("dungeonName")
@@ -166291,10 +166737,10 @@ local ok, reason = xpcall(function()
     if context.notify then
         context.notify("run", "Harvard ready", "Auto-start dungeon: " .. (context.CFG.autoStartDungeon ~= false and "ON" or "OFF") .. ". All controls are in this menu.")
     end
-    print("[DQR Harvard V24] Ready: Harvard menu only; auto-start " .. tostring(context.CFG.autoStartDungeon ~= false))
+    print("[DQR Harvard V25] Ready: Harvard menu only; auto-start " .. tostring(context.CFG.autoStartDungeon ~= false))
 end, function(err) return debug.traceback(tostring(err), 2) end)
 if not ok then
-    warn("[DQR Harvard V24] " .. currentStage .. ": " .. tostring(reason))
+    warn("[DQR Harvard V25] " .. currentStage .. ": " .. tostring(reason))
     stopHarvardEngine()
     pcall(function()
         getService("StarterGui"):SetCore("SendNotification", {
@@ -166317,8 +166763,8 @@ local cached, cacheError = pcall(function()
     assert(readfile(cachePath)==payload, "saved engine verification failed")
 end)
 env.DQRHarvardCacheReady = cached
-if not cached then warn("[DQR Harvard V24] Auto-execute cache unavailable: "..tostring(cacheError)) end
+if not cached then warn("[DQR Harvard V25] Auto-execute cache unavailable: "..tostring(cacheError)) end
 assert(type(loadstring)=="function", "Executor loadstring is required to run the bundled engine")
-local run, compileError = loadstring(payload,"@DQR_Harvard_V24")
+local run, compileError = loadstring(payload,"@DQR_Harvard_V25")
 assert(run,tostring(compileError))
 return run()
